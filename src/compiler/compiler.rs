@@ -843,8 +843,7 @@ where
                 } => break job_alloc,
                 dist::AllocJobResult::Fail { msg } => {
                     // Server is busy - check config to decide whether to retry or fail
-                    // retry_on_busy or remote_only both enable retry behavior
-                    if dist_client.retry_on_busy() || dist_client.remote_only() {
+                    if dist_client.remote_only() {
                         // Retry with random backoff
                         let sleep_millis = rand::thread_rng().gen_range(1000..=10000);
                         info!(
@@ -3145,9 +3144,6 @@ mod test_dist {
         fn rewrite_includes_only(&self) -> bool {
             false
         }
-        fn retry_on_busy(&self) -> bool {
-            false
-        }
         fn remote_only(&self) -> bool {
             false
         }
@@ -3203,9 +3199,6 @@ mod test_dist {
             Ok((self.tc.clone(), None))
         }
         fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn retry_on_busy(&self) -> bool {
             false
         }
         fn remote_only(&self) -> bool {
@@ -3280,9 +3273,6 @@ mod test_dist {
             Ok((self.tc.clone(), None))
         }
         fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn retry_on_busy(&self) -> bool {
             false
         }
         fn remote_only(&self) -> bool {
@@ -3365,9 +3355,6 @@ mod test_dist {
             ))
         }
         fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn retry_on_busy(&self) -> bool {
             false
         }
         fn remote_only(&self) -> bool {
@@ -3470,9 +3457,6 @@ mod test_dist {
             ))
         }
         fn rewrite_includes_only(&self) -> bool {
-            false
-        }
-        fn retry_on_busy(&self) -> bool {
             false
         }
         fn remote_only(&self) -> bool {
