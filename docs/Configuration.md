@@ -24,12 +24,6 @@ cache_dir = "/home/user/.cache/sccache-dist-client"
 # When false (default), distributed compilation is attempted but falls back to local compilation on errors.
 remote_only = false
 
-# DEPRECATED: Use remote_only instead.
-# When true, retry job allocation when the server is busy instead of falling back to local compilation.
-# When false (default), fall back to local compilation immediately when the server is busy.
-# This option is kept for backwards compatibility and is interpreted as remote_only when set to true.
-retry_on_busy = false
-
 [dist.auth]
 type = "token"
 token = "secrettoken"

@@ -1110,7 +1110,6 @@ mod client {
     /// Configuration options for the distributed client
     pub struct ClientConfig {
         pub rewrite_includes_only: bool,
-        pub retry_on_busy: bool,
         pub remote_only: bool,
     }
 
@@ -1123,7 +1122,6 @@ mod client {
         pool: tokio::runtime::Handle,
         tc_cache: Arc<cache::ClientToolchains>,
         rewrite_includes_only: bool,
-        retry_on_busy: bool,
         remote_only: bool,
     }
 
@@ -1158,7 +1156,6 @@ mod client {
                 pool: pool.clone(),
                 tc_cache: Arc::new(client_toolchains),
                 rewrite_includes_only: config.rewrite_includes_only,
-                retry_on_busy: config.retry_on_busy,
                 remote_only: config.remote_only,
             })
         }
@@ -1349,9 +1346,6 @@ mod client {
 
         fn rewrite_includes_only(&self) -> bool {
             self.rewrite_includes_only
-        }
-        fn retry_on_busy(&self) -> bool {
-            self.retry_on_busy
         }
         fn remote_only(&self) -> bool {
             self.remote_only

@@ -157,7 +157,6 @@ pub struct DistClientConfig {
     toolchain_cache_size: u64,
     toolchains: Vec<config::DistToolchainConfig>,
     rewrite_includes_only: bool,
-    retry_on_busy: bool,
     remote_only: bool,
 }
 
@@ -223,8 +222,7 @@ impl DistClientContainer {
             toolchain_cache_size: config.dist.toolchain_cache_size,
             toolchains: config.dist.toolchains.clone(),
             rewrite_includes_only: config.dist.rewrite_includes_only,
-            retry_on_busy: config.dist.retry_on_busy,
-            remote_only: config.dist.get_remote_only(),
+            remote_only: config.dist.remote_only,
         };
         let state = Self::create_state(config);
         let state = pool.block_on(state);
@@ -396,7 +394,6 @@ impl DistClientContainer {
                 );
                 let client_config = dist::http::ClientConfig {
                     rewrite_includes_only: config.rewrite_includes_only,
-                    retry_on_busy: config.retry_on_busy,
                     remote_only: config.remote_only,
                 };
                 let dist_client = dist::http::Client::new(
@@ -445,7 +442,6 @@ impl DistClientContainer {
     }
 
     /// Get the remote_only configuration value.
-    /// Returns true if remote_only or retry_on_busy is enabled.
     pub async fn get_remote_only(&self) -> bool {
         let guard = self.state.lock().await;
         match &*guard {
@@ -1017,7 +1013,6 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
-                    retry_on_busy: false,
                     remote_only: false,
                 }),
                 dist_client,
