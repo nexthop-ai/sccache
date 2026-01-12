@@ -1299,6 +1299,26 @@ mod client {
         ) -> Result<(RunJobResult, PathTransformer)> {
             let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
 
+            // BOTTLENECK: This spawn_blocking call can cause 60+ second delays in large builds
+            //
+            // This uses Tokio's blocking thread pool (default max: 512 threads) to perform
+            // CPU-intensive work: serializing the compile command and compressing the preprocessed
+            // source code and input files.
+            //
+            // In large parallel builds (100+ files compiling simultaneously):
+            //   - Jobs are allocated from the scheduler (fast async HTTP call)
+            //   - The scheduler starts a 60-second "unclaimed job" timeout
+            //   - Each job then tries to package its inputs via spawn_blocking
+            //   - If all 512 blocking threads are busy, jobs queue up waiting
+            //   - A job might wait 60+ seconds for a blocking thread to become available
+            //   - By the time packaging completes, the scheduler has deleted the job as "stale"
+            //   - The subsequent HTTP request fails with "Unknown job"
+            //
+            // This is the root cause of distributed compilation timeouts in large builds.
+            // The job allocation happens before we check if we have resources (blocking threads)
+            // available to actually execute the job.
+            //
+            // See also: Comment in src/server.rs where the runtime is configured.
             let (body, path_transformer) = self
                 .pool
                 .spawn_blocking(move || -> Result<_> {
