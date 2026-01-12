@@ -538,9 +538,10 @@ pub enum AllocJobResult {
         job_alloc: JobAlloc,
         need_toolchain: bool,
     },
-    Fail {
-        msg: String,
-    },
+    /// Failure where we successfully communicated with the scheduler/worker
+    Fail { msg: String },
+    /// Failure due to communication error with the worker
+    CommunicationError { msg: String },
 }
 
 // AssignJob

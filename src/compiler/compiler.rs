@@ -841,8 +841,9 @@ where
                     job_alloc,
                     need_toolchain: false,
                 } => break job_alloc,
-                dist::AllocJobResult::Fail { msg } => {
-                    // Server is busy - check config to decide whether to retry or fail
+                dist::AllocJobResult::Fail { msg }
+                | dist::AllocJobResult::CommunicationError { msg } => {
+                    // Server is busy or communication error - check config to decide whether to retry or fail
                     if dist_client.remote_only() {
                         // Retry with random backoff
                         let sleep_millis = rand::thread_rng().gen_range(1000..=10000);
@@ -854,7 +855,7 @@ where
                         // Continue the loop to retry
                     } else {
                         // Fail immediately to trigger local fallback
-                        bail!("Server busy: {}", msg);
+                        bail!("Failed to allocate job: {}", msg);
                     }
                 }
             }

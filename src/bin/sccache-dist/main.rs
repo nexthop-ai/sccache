@@ -527,10 +527,9 @@ impl SchedulerIncoming for Scheduler {
                 return Ok(AllocJobResult::Fail { msg });
             }
         };
-        let AssignJobResult {
-            state,
-            need_toolchain,
-        } = requester
+
+        // Try to assign the job to the server
+        let assign_result = requester
             .do_assign_job(server_id, job_id, tc, auth.clone())
             .with_context(|| {
                 // LOCKS
@@ -546,7 +545,22 @@ impl SchedulerIncoming for Scheduler {
                 } else {
                     "assign job failed and server not known"
                 }
-            })?;
+            });
+
+        // If do_assign_job() failed (e.g., timeout, server busy), return
+        // CommunicationError instead of propagating error.
+        let AssignJobResult {
+            state,
+            need_toolchain,
+        } = match assign_result {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(AllocJobResult::CommunicationError {
+                    msg: format!("Failed to assign job to server: {:#}", e),
+                });
+            }
+        };
+
         {
             // LOCKS
             let mut jobs = self.jobs.lock().unwrap();
