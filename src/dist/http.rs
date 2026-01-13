@@ -111,6 +111,9 @@ mod common {
         Fail {
             msg: String,
         },
+        CommunicationError {
+            msg: String,
+        },
     }
     impl AllocJobHttpResponse {
         #[cfg(feature = "dist-server")]
@@ -139,6 +142,9 @@ mod common {
                     }
                 }
                 dist::AllocJobResult::Fail { msg } => AllocJobHttpResponse::Fail { msg },
+                dist::AllocJobResult::CommunicationError { msg } => {
+                    AllocJobHttpResponse::CommunicationError { msg }
+                }
             }
         }
     }
@@ -1251,6 +1257,9 @@ mod client {
                     alloc_job_res
                 }
                 AllocJobHttpResponse::Fail { msg } => Ok(AllocJobResult::Fail { msg }),
+                AllocJobHttpResponse::CommunicationError { msg } => {
+                    Ok(AllocJobResult::CommunicationError { msg })
+                }
             }
         }
 
