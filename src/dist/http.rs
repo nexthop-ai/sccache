@@ -1086,7 +1086,6 @@ mod client {
     use byteorder::{BigEndian, WriteBytesExt};
     use flate2::Compression;
     use flate2::write::ZlibEncoder as ZlibWriteEncoder;
-    use futures::TryFutureExt;
     use reqwest::Body;
     use std::collections::HashMap;
     use std::env;
@@ -1290,37 +1289,13 @@ mod client {
             }
         }
 
-        async fn do_run_job(
+        async fn package_inputs(
             &self,
-            job_alloc: JobAlloc,
             command: CompileCommand,
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
-            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
-
-            // BOTTLENECK: This spawn_blocking call can cause 60+ second delays in large builds
-            //
-            // This uses Tokio's blocking thread pool (default max: 512 threads) to perform
-            // CPU-intensive work: serializing the compile command and compressing the preprocessed
-            // source code and input files.
-            //
-            // In large parallel builds (100+ files compiling simultaneously):
-            //   - Jobs are allocated from the scheduler (fast async HTTP call)
-            //   - The scheduler starts a 60-second "unclaimed job" timeout
-            //   - Each job then tries to package its inputs via spawn_blocking
-            //   - If all 512 blocking threads are busy, jobs queue up waiting
-            //   - A job might wait 60+ seconds for a blocking thread to become available
-            //   - By the time packaging completes, the scheduler has deleted the job as "stale"
-            //   - The subsequent HTTP request fails with "Unknown job"
-            //
-            // This is the root cause of distributed compilation timeouts in large builds.
-            // The job allocation happens before we check if we have resources (blocking threads)
-            // available to actually execute the job.
-            //
-            // See also: Comment in src/server.rs where the runtime is configured.
-            let (body, path_transformer) = self
-                .pool
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            self.pool
                 .spawn_blocking(move || -> Result<_> {
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
                         .context("failed to serialize run job request")?;
@@ -1348,12 +1323,20 @@ mod client {
 
                     Ok((body, path_transformer))
                 })
-                .await??;
+                .await?
+        }
+
+        async fn do_run_job(
+            &self,
+            job_alloc: JobAlloc,
+            packaged_inputs: Vec<u8>,
+        ) -> Result<RunJobResult> {
+            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
             let mut req = self.client.lock().unwrap().post(url);
-            req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
-                .map_ok(|res| (res, path_transformer))
-                .await
+            req = req
+                .bearer_auth(job_alloc.auth.clone())
+                .bytes(packaged_inputs);
+            bincode_req_fut(req).await
         }
 
         async fn put_toolchain(

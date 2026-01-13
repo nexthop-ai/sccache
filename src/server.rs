@@ -478,49 +478,6 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     }));
     let client = Client::new();
 
-    // TOKIO RUNTIME CONFIGURATION
-    //
-    // This runtime has two separate thread pools:
-    //
-    // 1. ASYNC WORKER THREADS (configured below):
-    //    - Count: max(20, 2 * num_cpus) - typically 96 threads on a 48-core machine
-    //    - Purpose: Handle async I/O operations (HTTP requests, async process spawning, etc.)
-    //    - Used by: Preprocessing (via tokio::process::Child), HTTP requests, async I/O
-    //
-    // 2. BLOCKING THREAD POOL (Tokio default, not configured here):
-    //    - Count: 512 threads maximum (Tokio default, created on-demand)
-    //    - Purpose: Handle CPU-intensive blocking operations via spawn_blocking()
-    //    - Used by: Input packaging/compression, toolchain packaging, cache extraction
-    //
-    // KNOWN ISSUE - Distributed Compilation Timeout:
-    //
-    // In large parallel builds (100+ files), the blocking thread pool can become a bottleneck:
-    //
-    // Timeline of a distributed compilation:
-    //   1. Preprocess source file (async, runs on worker threads) ✓
-    //   2. Generate hash key (fast, CPU work on async thread) ✓
-    //   3. Check cache (async I/O) ✓
-    //   4. Allocate job from scheduler (async HTTP) ✓
-    //      ⏰ Scheduler starts 60-second "unclaimed job" timeout here
-    //   5. Package inputs via spawn_blocking() ⚠️ BOTTLENECK
-    //      - Waits for one of 512 blocking threads to become available
-    //      - Other jobs are using blocking threads for their own packaging
-    //      - This can take >60 seconds in large builds
-    //   6. Send run_job HTTP request to build server
-    //      ⚠️ If >60 seconds since step 4, scheduler has already deleted the job
-    //
-    // The problem: Jobs are allocated (timeout starts) before checking if blocking threads
-    // are available to package inputs. In massive builds, jobs can wait 60+ seconds for a
-    // blocking thread, causing the scheduler to mark them as "stale" and delete them.
-    //
-    // This is a producer-consumer mismatch: job allocation (fast async HTTP) vastly outpaces
-    // job execution (limited by 512 blocking threads doing CPU-intensive work).
-    //
-    // Potential solutions:
-    //   - Increase blocking thread pool size via max_blocking_threads()
-    //   - Add backpressure: limit concurrent job allocations based on blocking thread availability
-    //   - Start timeout when run_job is called, not when job is allocated
-    //   - Make input packaging async instead of using spawn_blocking
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(std::cmp::max(20, 2 * util::num_cpus()))
