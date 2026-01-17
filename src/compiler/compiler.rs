@@ -838,7 +838,24 @@ where
                     "[{}]: Requesting allocation (execution attempt {}/{})",
                     out_pretty, execution_attempt, MAX_EXECUTION_ATTEMPTS
                 );
-                let jares = dist_client.do_alloc_job(dist_toolchain.clone()).await?;
+                let jares = match dist_client.do_alloc_job(dist_toolchain.clone()).await {
+                    Ok(result) => result,
+                    Err(e) => {
+                        if dist_client.remote_only() {
+                            let backoff = retry_backoff(execution_attempt);
+                            warn!(
+                                "[{}]: Allocation request failed: {}. Retrying in {:.2}s...",
+                                out_pretty,
+                                e,
+                                backoff.as_secs_f64()
+                            );
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                };
                 match jares {
                     dist::AllocJobResult::Success {
                         job_alloc,
