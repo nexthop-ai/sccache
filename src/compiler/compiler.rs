@@ -834,10 +834,11 @@ where
                 if remote_only {
                     let backoff = retry_backoff(attempt);
                     warn!(
-                        "[{}]: {}. Retrying in {:.2}s...",
+                        "[{}]: {}. Retrying in {:.2}s... (attempt {})",
                         out_pretty,
                         msg,
-                        backoff.as_secs_f64()
+                        backoff.as_secs_f64(),
+                        attempt
                     );
                     tokio::time::sleep(backoff).await;
                     Ok(())
