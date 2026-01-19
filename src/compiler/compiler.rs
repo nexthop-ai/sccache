@@ -826,80 +826,94 @@ where
             Duration::from_millis(millis)
         };
 
-        const MAX_EXECUTION_ATTEMPTS: u32 = 3;
-        let mut execution_attempt = 0;
+        // Helper to retry on failure in remote_only mode
+        // Returns Ok(()) if remote_only (caller should continue), or Err(e) to propagate the error
+        let maybe_retry = |attempt: u32, msg: String, err: anyhow::Error| {
+            let out_pretty = &out_pretty;
+            async move {
+                if remote_only {
+                    let backoff = retry_backoff(attempt);
+                    warn!(
+                        "[{}]: {}. Retrying in {:.2}s...",
+                        out_pretty,
+                        msg,
+                        backoff.as_secs_f64()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            }
+        };
+
+        let mut attempt = 0;
 
         let (jc, final_server_id) = loop {
-            execution_attempt += 1;
+            attempt += 1;
 
-            // Allocate job (with retry for busy servers)
-            let job_alloc = loop {
-                debug!(
-                    "[{}]: Requesting allocation (execution attempt {}/{})",
-                    out_pretty, execution_attempt, MAX_EXECUTION_ATTEMPTS
-                );
-                let jares = match dist_client.do_alloc_job(dist_toolchain.clone()).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        if dist_client.remote_only() {
-                            let backoff = retry_backoff(execution_attempt);
-                            warn!(
-                                "[{}]: Allocation request failed: {}. Retrying in {:.2}s...",
-                                out_pretty,
-                                e,
-                                backoff.as_secs_f64()
-                            );
-                            tokio::time::sleep(backoff).await;
+            // Allocate job
+            debug!(
+                "[{}]: Requesting allocation (attempt {})",
+                out_pretty, attempt
+            );
+            let jares = match dist_client.do_alloc_job(dist_toolchain.clone()).await {
+                Ok(result) => result,
+                Err(e) => {
+                    maybe_retry(attempt, format!("Allocation request failed: {}", e), e).await?;
+                    continue;
+                }
+            };
+
+            let job_alloc = match jares {
+                dist::AllocJobResult::Success {
+                    job_alloc,
+                    need_toolchain: true,
+                } => {
+                    debug!(
+                        "[{}]: Sending toolchain {} for job {}",
+                        out_pretty, dist_toolchain.archive_id, job_alloc.job_id
+                    );
+
+                    match dist_client
+                        .do_submit_toolchain(job_alloc.clone(), dist_toolchain.clone())
+                        .await
+                    {
+                        Ok(dist::SubmitToolchainResult::Success) => job_alloc,
+                        Ok(dist::SubmitToolchainResult::JobNotFound)
+                        | Ok(dist::SubmitToolchainResult::CannotCache) => {
+                            maybe_retry(
+                                attempt,
+                                format!("Toolchain submission failed for job {}", job_alloc.job_id),
+                                anyhow!("Toolchain submission failed for job {}", job_alloc.job_id),
+                            )
+                            .await?;
                             continue;
-                        } else {
-                            return Err(e);
+                        }
+                        Err(e) => {
+                            maybe_retry(
+                                attempt,
+                                format!("Could not submit toolchain: {}", e),
+                                e.context("Could not submit toolchain"),
+                            )
+                            .await?;
+                            continue;
                         }
                     }
-                };
-                match jares {
-                    dist::AllocJobResult::Success {
-                        job_alloc,
-                        need_toolchain: true,
-                    } => {
-                        debug!(
-                            "[{}]: Sending toolchain {} for job {}",
-                            out_pretty, dist_toolchain.archive_id, job_alloc.job_id
-                        );
-
-                        match dist_client
-                            .do_submit_toolchain(job_alloc.clone(), dist_toolchain.clone())
-                            .await
-                            .map_err(|e| e.context("Could not submit toolchain"))?
-                        {
-                            dist::SubmitToolchainResult::Success => break job_alloc,
-                            dist::SubmitToolchainResult::JobNotFound => {
-                                bail!("Job {} not found on server", job_alloc.job_id)
-                            }
-                            dist::SubmitToolchainResult::CannotCache => bail!(
-                                "Toolchain for job {} could not be cached by server",
-                                job_alloc.job_id
-                            ),
-                        }
-                    }
-                    dist::AllocJobResult::Success {
-                        job_alloc,
-                        need_toolchain: false,
-                    } => break job_alloc,
-                    dist::AllocJobResult::Fail { msg }
-                    | dist::AllocJobResult::CommunicationError { msg } => {
-                        if dist_client.remote_only() {
-                            let backoff = retry_backoff(execution_attempt);
-                            info!(
-                                "[{}]: Failed to allocate job: {}. Retrying in {:.2}s...",
-                                out_pretty,
-                                msg,
-                                backoff.as_secs_f64()
-                            );
-                            tokio::time::sleep(backoff).await;
-                        } else {
-                            bail!("Failed to allocate job: {}", msg);
-                        }
-                    }
+                }
+                dist::AllocJobResult::Success {
+                    job_alloc,
+                    need_toolchain: false,
+                } => job_alloc,
+                dist::AllocJobResult::Fail { msg }
+                | dist::AllocJobResult::CommunicationError { msg } => {
+                    maybe_retry(
+                        attempt,
+                        format!("Failed to allocate job: {}", msg),
+                        anyhow!("Failed to allocate job: {}", msg),
+                    )
+                    .await?;
+                    continue;
                 }
             };
 
@@ -913,9 +927,7 @@ where
                 .await
             {
                 Ok(dist::RunJobResult::Complete(jc)) => break (jc, server_id),
-                Ok(dist::RunJobResult::JobNotFound) | Err(_)
-                    if dist_client.remote_only() && execution_attempt < MAX_EXECUTION_ATTEMPTS =>
-                {
+                Ok(dist::RunJobResult::JobNotFound) if remote_only => {
                     // In theory if we get here then something went wrong with
                     // the server and we should just abort.  But in practice,
                     // "sometimes" we get here just because something somewhere
@@ -925,28 +937,34 @@ where
                     // that the scheduler has un-assigned the job by the time it
                     // gets the run request.
                     // 2. We get a timeout trying to talk to the worker.
-                    let backoff = retry_backoff(execution_attempt);
-                    warn!(
-                        "[{}]: Job execution failed on {:?}, re-allocating (attempt {}/{}). Retrying in {:.2}s...",
-                        out_pretty,
-                        server_id,
-                        execution_attempt,
-                        MAX_EXECUTION_ATTEMPTS,
-                        backoff.as_secs_f64()
-                    );
-                    tokio::time::sleep(backoff).await;
+                    maybe_retry(
+                        attempt,
+                        format!("Job execution failed on {:?}", server_id),
+                        anyhow!("Job not found on server"),
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(e) if remote_only => {
+                    maybe_retry(
+                        attempt,
+                        format!("Job execution failed on {:?}", server_id),
+                        e.context(format!(
+                            "could not run distributed compilation job on {:?}",
+                            server_id
+                        )),
+                    )
+                    .await?;
+                    continue;
                 }
                 Ok(dist::RunJobResult::JobNotFound) => {
-                    bail!(
-                        "Job not found on server after {} attempts",
-                        MAX_EXECUTION_ATTEMPTS
-                    );
+                    bail!("Job not found on server");
                 }
                 Err(e) => {
                     return Err(e).with_context(|| {
                         format!(
-                            "could not run distributed compilation job on {:?} after {} attempts",
-                            server_id, execution_attempt
+                            "could not run distributed compilation job on {:?}",
+                            server_id
                         )
                     });
                 }
