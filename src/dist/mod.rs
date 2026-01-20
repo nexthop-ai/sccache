@@ -738,14 +738,23 @@ pub trait Client: Send + Sync {
         job_alloc: JobAlloc,
         tc: Toolchain,
     ) -> Result<SubmitToolchainResult>;
+    // This method performs CPU-intensive packaging work (compression, serialization).
+    // Returns:
+    //   - Vec<u8>: The packaged/compressed inputs ready to send to the build server
+    //   - PathTransformer: Maps between local paths and server paths, needed to transform
+    //                      output file paths when the job completes
+    async fn package_inputs(
+        &self,
+        command: CompileCommand,
+        outputs: Vec<String>,
+        inputs_packager: Box<dyn pkg::InputsPackager>,
+    ) -> Result<(Vec<u8>, PathTransformer)>;
     // To Server
     async fn do_run_job(
         &self,
         job_alloc: JobAlloc,
-        command: CompileCommand,
-        outputs: Vec<String>,
-        inputs_packager: Box<dyn pkg::InputsPackager>,
-    ) -> Result<(RunJobResult, PathTransformer)>;
+        packaged_inputs: Vec<u8>,
+    ) -> Result<RunJobResult>;
     async fn put_toolchain(
         &self,
         compiler_path: PathBuf,

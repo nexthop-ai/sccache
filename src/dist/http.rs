@@ -1086,7 +1086,6 @@ mod client {
     use byteorder::{BigEndian, WriteBytesExt};
     use flate2::Compression;
     use flate2::write::ZlibEncoder as ZlibWriteEncoder;
-    use futures::TryFutureExt;
     use reqwest::Body;
     use std::collections::HashMap;
     use std::env;
@@ -1290,17 +1289,13 @@ mod client {
             }
         }
 
-        async fn do_run_job(
+        async fn package_inputs(
             &self,
-            job_alloc: JobAlloc,
             command: CompileCommand,
             outputs: Vec<String>,
             inputs_packager: Box<dyn InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
-            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
-
-            let (body, path_transformer) = self
-                .pool
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            self.pool
                 .spawn_blocking(move || -> Result<_> {
                     let bincode = bincode::serialize(&RunJobHttpRequest { command, outputs })
                         .context("failed to serialize run job request")?;
@@ -1328,12 +1323,20 @@ mod client {
 
                     Ok((body, path_transformer))
                 })
-                .await??;
+                .await?
+        }
+
+        async fn do_run_job(
+            &self,
+            job_alloc: JobAlloc,
+            packaged_inputs: Vec<u8>,
+        ) -> Result<RunJobResult> {
+            let url = urls::server_run_job(job_alloc.server_id, job_alloc.job_id);
             let mut req = self.client.lock().unwrap().post(url);
-            req = req.bearer_auth(job_alloc.auth.clone()).bytes(body);
-            bincode_req_fut(req)
-                .map_ok(|res| (res, path_transformer))
-                .await
+            req = req
+                .bearer_auth(job_alloc.auth.clone())
+                .bytes(packaged_inputs);
+            bincode_req_fut(req).await
         }
 
         async fn put_toolchain(

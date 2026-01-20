@@ -788,7 +788,7 @@ where
         let mut dist_compile_cmd =
             dist_compile_cmd.context("Could not create distributed compile command")?;
         debug!("[{}]: Creating distributed compile request", out_pretty);
-        let dist_output_paths = compilation
+        let dist_output_paths: Vec<String> = compilation
             .outputs()
             .map(|output| path_transformer.as_dist_abs(&cwd.join(output.path)))
             .collect::<Option<_>>()
@@ -808,6 +808,16 @@ where
             dist_compile_cmd.executable = dist_compile_executable;
             tc_archive = Some(archive_path);
         }
+
+        debug!("[{}]: Packaging inputs", out_pretty);
+        let (packaged_inputs, path_transformer) = dist_client
+            .package_inputs(
+                dist_compile_cmd.clone(),
+                dist_output_paths.clone(),
+                inputs_packager,
+            )
+            .await
+            .context("Could not package inputs for compilation")?;
 
         let job_alloc = loop {
             debug!("[{}]: Requesting allocation", out_pretty);
@@ -864,13 +874,8 @@ where
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
         debug!("[{}]: Running job", out_pretty);
-        let ((job_id, server_id), (jres, path_transformer)) = dist_client
-            .do_run_job(
-                job_alloc,
-                dist_compile_cmd,
-                dist_output_paths,
-                inputs_packager,
-            )
+        let ((job_id, server_id), jres) = dist_client
+            .do_run_job(job_alloc, packaged_inputs)
             .await
             .map(move |res| ((job_id, server_id), res))
             .with_context(|| {
@@ -3125,13 +3130,15 @@ mod test_dist {
         ) -> Result<SubmitToolchainResult> {
             unreachable!()
         }
-        async fn do_run_job(
+        async fn package_inputs(
             &self,
-            _: JobAlloc,
             _: CompileCommand,
             _: Vec<String>,
             _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            unreachable!()
+        }
+        async fn do_run_job(&self, _: JobAlloc, _: Vec<u8>) -> Result<RunJobResult> {
             unreachable!()
         }
         async fn put_toolchain(
@@ -3182,14 +3189,19 @@ mod test_dist {
         ) -> Result<SubmitToolchainResult> {
             unreachable!()
         }
-        async fn do_run_job(
+        async fn package_inputs(
             &self,
-            _: JobAlloc,
             _: CompileCommand,
             _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
-            unreachable!()
+            inputs_packager: Box<dyn pkg::InputsPackager>,
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            // This is called before allocation, so we need to package inputs
+            let mut inputs = vec![];
+            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+            Ok((inputs, path_transformer))
+        }
+        async fn do_run_job(&self, _: JobAlloc, _: Vec<u8>) -> Result<RunJobResult> {
+            unreachable!("do_run_job should not be called when alloc_job fails")
         }
         async fn put_toolchain(
             &self,
@@ -3256,14 +3268,21 @@ mod test_dist {
             assert_eq!(self.tc, tc);
             Err(anyhow!("MOCK: submit toolchain failure"))
         }
-        async fn do_run_job(
+        async fn package_inputs(
             &self,
-            _: JobAlloc,
             _: CompileCommand,
             _: Vec<String>,
-            _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
-            unreachable!("fn do_run_job is not used for this test. qed")
+            inputs_packager: Box<dyn pkg::InputsPackager>,
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            // This is called before allocation, so we need to package inputs
+            let mut inputs = vec![];
+            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+            Ok((inputs, path_transformer))
+        }
+        async fn do_run_job(&self, _: JobAlloc, _: Vec<u8>) -> Result<RunJobResult> {
+            unreachable!(
+                "fn do_run_job is not used for this test because submit_toolchain fails. qed"
+            )
         }
         async fn put_toolchain(
             &self,
@@ -3330,15 +3349,16 @@ mod test_dist {
             assert_eq!(self.tc, tc);
             Ok(SubmitToolchainResult::Success)
         }
-        async fn do_run_job(
+        async fn package_inputs(
             &self,
-            job_alloc: JobAlloc,
-            command: CompileCommand,
+            _: CompileCommand,
             _: Vec<String>,
             _: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            Ok((vec![], PathTransformer::new()))
+        }
+        async fn do_run_job(&self, job_alloc: JobAlloc, _: Vec<u8>) -> Result<RunJobResult> {
             assert_eq!(job_alloc.job_id, JobId(0));
-            assert_eq!(command.executable, "/overridden/compiler");
             Err(anyhow!("MOCK: run job failure"))
         }
         async fn put_toolchain(
@@ -3417,31 +3437,44 @@ mod test_dist {
 
             Ok(SubmitToolchainResult::Success)
         }
+        async fn package_inputs(
+            &self,
+            _: CompileCommand,
+            outputs: Vec<String>,
+            inputs_packager: Box<dyn pkg::InputsPackager>,
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            let mut inputs = vec![];
+            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+
+            // Encode outputs list in the body so do_run_job can extract it
+            // Format: newline-separated list of output file names
+            let body = outputs.join("\n").into_bytes();
+
+            Ok((body, path_transformer))
+        }
         async fn do_run_job(
             &self,
             job_alloc: JobAlloc,
-            command: CompileCommand,
-            outputs: Vec<String>,
-            inputs_packager: Box<dyn pkg::InputsPackager>,
-        ) -> Result<(RunJobResult, PathTransformer)> {
+            packaged_inputs: Vec<u8>,
+        ) -> Result<RunJobResult> {
             assert_eq!(job_alloc.job_id, JobId(0));
-            assert_eq!(command.executable, "/overridden/compiler");
 
-            let mut inputs = vec![];
-            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
-            let outputs = outputs
-                .into_iter()
+            // Decode the outputs list from the packaged body
+            let outputs_str = String::from_utf8(packaged_inputs).unwrap();
+            let outputs = outputs_str
+                .lines()
                 .map(|name| {
                     let data = format!("some data in {}", name);
                     let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
-                    (name, data)
+                    (name.to_string(), data)
                 })
                 .collect();
+
             let result = RunJobResult::Complete(JobComplete {
                 output: self.output.clone(),
                 outputs,
             });
-            Ok((result, path_transformer))
+            Ok(result)
         }
         async fn put_toolchain(
             &self,
