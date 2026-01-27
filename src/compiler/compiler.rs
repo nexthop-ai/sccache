@@ -751,7 +751,6 @@ async fn dist_or_local_compile<T>(
 where
     T: CommandCreatorSync,
 {
-    use rand::Rng;
     use std::io;
 
     let rewrite_includes_only = match dist_client {
@@ -819,20 +818,13 @@ where
             .await
             .context("Could not package inputs for compilation")?;
 
-        // Compute retry backoff: random time between 500ms and 2^attempt seconds
-        let retry_backoff = |attempt: u32| -> Duration {
-            let max_secs = 2_u64.pow(attempt).min(30);
-            let millis = rand::thread_rng().gen_range(500..=(max_secs * 1000));
-            Duration::from_millis(millis)
-        };
-
         // Helper to retry on failure in remote_only mode
         // Returns Ok(()) if remote_only (caller should continue), or Err(e) to propagate the error
         let maybe_retry = |attempt: u32, msg: String, err: anyhow::Error| {
             let out_pretty = &out_pretty;
             async move {
                 if remote_only {
-                    let backoff = retry_backoff(attempt);
+                    let backoff = crate::util::retry_backoff(attempt);
                     warn!(
                         "[{}]: {}. Retrying in {:.2}s... (attempt {})",
                         out_pretty,

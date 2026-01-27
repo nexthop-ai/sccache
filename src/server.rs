@@ -1374,45 +1374,59 @@ where
 
         self.rt
             .spawn(async move {
-                let result = match me.dist_client.get_client_and_config().await {
-                    Ok((client, remote_only)) => {
-                        // If remote_only is set but no client is available, fail immediately
-                        if remote_only && client.is_none() {
-                            Err(anyhow!("remote_only is enabled but distributed compilation is not available"))
-                        } else {
-                            std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
-                                &me,
-                                client,
-                                me.creator.clone(),
-                                me.storage.clone(),
-                                arguments,
-                                cwd,
-                                env_vars,
-                                cache_control,
-                                me.rt.clone(),
-                            ))
-                            .catch_unwind()
-                            .await
-                            .map_err(|e| {
-                                let panic = e
-                                    .downcast_ref::<&str>()
-                                    .map(|s| &**s)
-                                    .or_else(|| e.downcast_ref::<String>().map(|s| &**s))
-                                    .unwrap_or("An unknown panic was caught.");
-                                let thread = std::thread::current();
-                                let thread_name = thread.name().unwrap_or("unnamed");
-                                if let Some((file, line, column)) = PANIC_LOCATION.with(|l| l.take()) {
-                                    anyhow!(
-                                        "thread '{thread_name}' panicked at {file}:{line}:{column}: {panic}"
-                                    )
-                                } else {
-                                    anyhow!("thread '{thread_name}' panicked: {panic}")
-                                }
-                            })
-                            .and_then(std::convert::identity)
+                let mut attempt = 0;
+                let result = loop {
+                    attempt += 1;
+
+                    match me.dist_client.get_client_and_config().await {
+                        Ok((client, remote_only)) => {
+                            // If remote_only is set but no client is available, retry indefinitely with backoff
+                            if remote_only && client.is_none() {
+                                let backoff = crate::util::retry_backoff(attempt);
+                                warn!(
+                                    "[{}]: remote_only is enabled but distributed compilation is not available. Retrying in {:.2}s... (attempt {})",
+                                    out_pretty,
+                                    backoff.as_secs_f64(),
+                                    attempt
+                                );
+                                tokio::time::sleep(backoff).await;
+                                continue;
+                            } else {
+                                // Either not remote_only, or client is available - proceed with compilation
+                                break std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
+                                    &me,
+                                    client,
+                                    me.creator.clone(),
+                                    me.storage.clone(),
+                                    arguments,
+                                    cwd,
+                                    env_vars,
+                                    cache_control,
+                                    me.rt.clone(),
+                                ))
+                                .catch_unwind()
+                                .await
+                                .map_err(|e| {
+                                    let panic = e
+                                        .downcast_ref::<&str>()
+                                        .map(|s| &**s)
+                                        .or_else(|| e.downcast_ref::<String>().map(|s| &**s))
+                                        .unwrap_or("An unknown panic was caught.");
+                                    let thread = std::thread::current();
+                                    let thread_name = thread.name().unwrap_or("unnamed");
+                                    if let Some((file, line, column)) = PANIC_LOCATION.with(|l| l.take()) {
+                                        anyhow!(
+                                            "thread '{thread_name}' panicked at {file}:{line}:{column}: {panic}"
+                                        )
+                                    } else {
+                                        anyhow!("thread '{thread_name}' panicked: {panic}")
+                                    }
+                                })
+                                .and_then(std::convert::identity);
+                            }
                         }
+                        Err(e) => break Err(e),
                     }
-                    Err(e) => Err(e),
                 };
 
                 let mut cache_write = None;

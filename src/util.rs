@@ -402,6 +402,15 @@ pub fn fmt_duration_as_secs(duration: &Duration) -> String {
     format!("{}.{:03} s", duration.as_secs(), duration.subsec_millis())
 }
 
+/// Compute retry backoff with exponential backoff and jitter.
+/// Returns a duration between 500ms and 2^attempt seconds (capped at 30s).
+pub fn retry_backoff(attempt: u32) -> Duration {
+    use rand::Rng;
+    let max_secs = 2_u64.pow(attempt).min(30);
+    let millis = rand::thread_rng().gen_range(500..=(max_secs * 1000));
+    Duration::from_millis(millis)
+}
+
 /// If `input`, write it to `child`'s stdin while also reading `child`'s stdout and stderr, then wait on `child` and return its status and output.
 ///
 /// This was lifted from `std::process::Child::wait_with_output` and modified
