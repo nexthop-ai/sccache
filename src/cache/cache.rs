@@ -13,7 +13,7 @@
 // limitations under the License.
 
 #[cfg(feature = "azure")]
-use crate::cache::azure::AzureBlobCache;
+use crate::cache::azure::{AzureBlobCache, AzureBlobCredentialCache};
 use crate::cache::disk::DiskCache;
 #[cfg(feature = "gcs")]
 use crate::cache::gcs::GCSCache;
@@ -570,11 +570,23 @@ pub fn storage_from_config(
                 connection_string,
                 container,
                 key_prefix,
+                storage_account_endpoint,
             }) => {
                 debug!("Init azure cache with container {container}, key_prefix {key_prefix}");
-                let storage = AzureBlobCache::build(connection_string, container, key_prefix)
-                    .map_err(|err| anyhow!("create azure cache failed: {err:?}"))?;
-                return Ok(Arc::new(storage));
+                if let Some(conn_str) = connection_string {
+                    let storage = AzureBlobCache::build(conn_str, container, key_prefix)
+                        .map_err(|err| anyhow!("create azure cache failed: {err:?}"))?;
+                    return Ok(Arc::new(storage));
+                } else if let Some(endpoint) = storage_account_endpoint {
+                    let storage =
+                        AzureBlobCredentialCache::build(endpoint, container, key_prefix)
+                            .map_err(|err| {
+                                anyhow!("create azure credential cache failed: {err:?}")
+                            })?;
+                    return Ok(Arc::new(storage));
+                } else {
+                    bail!("Azure cache requires either connection_string or storage_account_endpoint");
+                }
             }
             #[cfg(feature = "gcs")]
             CacheType::GCS(config::GCSCacheConfig {
