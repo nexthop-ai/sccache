@@ -578,14 +578,13 @@ pub fn storage_from_config(
                         .map_err(|err| anyhow!("create azure cache failed: {err:?}"))?;
                     return Ok(Arc::new(storage));
                 } else if let Some(endpoint) = storage_account_endpoint {
-                    let storage =
-                        AzureBlobCredentialCache::build(endpoint, container, key_prefix)
-                            .map_err(|err| {
-                                anyhow!("create azure credential cache failed: {err:?}")
-                            })?;
+                    let storage = AzureBlobCredentialCache::build(endpoint, container, key_prefix)
+                        .map_err(|err| anyhow!("create azure credential cache failed: {err:?}"))?;
                     return Ok(Arc::new(storage));
                 } else {
-                    bail!("Azure cache requires either connection_string or storage_account_endpoint");
+                    bail!(
+                        "Azure cache requires either connection_string or storage_account_endpoint"
+                    );
                 }
             }
             #[cfg(feature = "gcs")]

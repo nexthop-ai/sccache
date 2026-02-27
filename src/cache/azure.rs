@@ -77,9 +77,7 @@ impl ChainedCredential {
             if let Ok(cred) = azure_identity::ClientSecretCredential::new(
                 &std::env::var("AZURE_TENANT_ID").unwrap(),
                 std::env::var("AZURE_CLIENT_ID").unwrap(),
-                azure_core::credentials::Secret::new(
-                    std::env::var("AZURE_CLIENT_SECRET").unwrap(),
-                ),
+                azure_core::credentials::Secret::new(std::env::var("AZURE_CLIENT_SECRET").unwrap()),
                 None,
             ) {
                 sources.push(cred);
