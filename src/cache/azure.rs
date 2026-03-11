@@ -33,6 +33,7 @@ impl AzureBlobCache {
     /// The returned operator is used by the generic storage layer to get/put
     /// cached compiler outputs.
     pub fn build(connection_string: &str, container: &str, key_prefix: &str) -> Result<Operator> {
+        debug!("azure blob cache build: container={container:?}, key_prefix={key_prefix:?}");
         let builder = Azblob::from_connection_string(connection_string)?
             .container(container)
             .root(key_prefix);
@@ -41,6 +42,7 @@ impl AzureBlobCache {
             .layer(HttpClientLayer::new(set_user_agent()))
             .layer(LoggingLayer::default())
             .finish();
+        debug!("azure blob cache build: OpenDAL operator ready");
         Ok(op)
     }
 }
@@ -70,30 +72,60 @@ impl ChainedCredential {
         let mut sources: Vec<Arc<dyn TokenCredential>> = Vec::new();
 
         // Try environment-based credentials (ClientSecretCredential)
-        if std::env::var("AZURE_CLIENT_ID").is_ok()
-            && std::env::var("AZURE_TENANT_ID").is_ok()
-            && std::env::var("AZURE_CLIENT_SECRET").is_ok()
-        {
-            if let Ok(cred) = azure_identity::ClientSecretCredential::new(
+        let has_client_id = std::env::var("AZURE_CLIENT_ID").is_ok();
+        let has_tenant_id = std::env::var("AZURE_TENANT_ID").is_ok();
+        let has_client_secret = std::env::var("AZURE_CLIENT_SECRET").is_ok();
+        debug!(
+            "azure credentials: AZURE_CLIENT_ID={}, AZURE_TENANT_ID={}, AZURE_CLIENT_SECRET={}",
+            if has_client_id { "<set>" } else { "<not set>" },
+            if has_tenant_id { "<set>" } else { "<not set>" },
+            if has_client_secret { "<set>" } else { "<not set>" },
+        );
+        if has_client_id && has_tenant_id && has_client_secret {
+            debug!("azure credentials: attempting ClientSecretCredential");
+            match azure_identity::ClientSecretCredential::new(
                 &std::env::var("AZURE_TENANT_ID").unwrap(),
                 std::env::var("AZURE_CLIENT_ID").unwrap(),
                 azure_core::credentials::Secret::new(std::env::var("AZURE_CLIENT_SECRET").unwrap()),
                 None,
             ) {
-                sources.push(cred);
+                Ok(cred) => {
+                    debug!("azure credentials: ClientSecretCredential added to chain");
+                    sources.push(cred);
+                }
+                Err(e) => {
+                    debug!("azure credentials: ClientSecretCredential failed to construct: {e:?}");
+                }
             }
+        } else {
+            debug!("azure credentials: skipping ClientSecretCredential (env vars incomplete)");
         }
 
         // Try managed identity
-        if let Ok(cred) = azure_identity::ManagedIdentityCredential::new(None) {
-            sources.push(cred);
+        debug!("azure credentials: attempting ManagedIdentityCredential");
+        match azure_identity::ManagedIdentityCredential::new(None) {
+            Ok(cred) => {
+                debug!("azure credentials: ManagedIdentityCredential added to chain");
+                sources.push(cred);
+            }
+            Err(e) => {
+                debug!("azure credentials: ManagedIdentityCredential unavailable: {e:?}");
+            }
         }
 
         // Try developer tools (Azure CLI + azd)
-        if let Ok(cred) = azure_identity::DeveloperToolsCredential::new(None) {
-            sources.push(cred);
+        debug!("azure credentials: attempting DeveloperToolsCredential");
+        match azure_identity::DeveloperToolsCredential::new(None) {
+            Ok(cred) => {
+                debug!("azure credentials: DeveloperToolsCredential added to chain");
+                sources.push(cred);
+            }
+            Err(e) => {
+                debug!("azure credentials: DeveloperToolsCredential unavailable: {e:?}");
+            }
         }
 
+        debug!("azure credentials: chain has {} source(s)", sources.len());
         if sources.is_empty() {
             bail!("No Azure credential sources available");
         }
@@ -109,16 +141,22 @@ impl TokenCredential for ChainedCredential {
         scopes: &[&str],
         options: Option<azure_core::credentials::TokenRequestOptions<'_>>,
     ) -> azure_core::Result<azure_core::credentials::AccessToken> {
+        debug!("azure get_token: requesting token for scopes={scopes:?}");
         let mut last_error = None;
-        for source in &self.sources {
+        for (i, source) in self.sources.iter().enumerate() {
+            debug!("azure get_token: trying credential source [{i}]");
             match source.get_token(scopes, options.clone()).await {
-                Ok(token) => return Ok(token),
+                Ok(token) => {
+                    debug!("azure get_token: credential source [{i}] succeeded");
+                    return Ok(token);
+                }
                 Err(e) => {
-                    debug!("Credential source failed: {:?}", e);
+                    debug!("azure get_token: credential source [{i}] failed: {e:?}");
                     last_error = Some(e);
                 }
             }
         }
+        debug!("azure get_token: all credential sources exhausted");
         Err(last_error.unwrap_or_else(|| {
             azure_core::Error::with_message(
                 azure_core::error::ErrorKind::Credential,
@@ -143,7 +181,9 @@ impl AzureBlobCredentialCache {
     /// Create a new credential-based cache, initialising the `ChainedCredential`
     /// that will be shared across all blob operations for this session.
     pub fn build(endpoint: &str, container: &str, key_prefix: &str) -> Result<Self> {
+        debug!("azure build: endpoint={endpoint:?}, container={container:?}, key_prefix={key_prefix:?}");
         let credential = ChainedCredential::new()?;
+        debug!("azure build: credential chain ready");
         Ok(Self {
             endpoint: endpoint.to_owned(),
             container: container.to_owned(),
@@ -183,9 +223,11 @@ impl AzureBlobCredentialCache {
 impl Storage for AzureBlobCredentialCache {
     async fn get(&self, key: &str) -> Result<super::cache::Cache> {
         let blob_name = self.blob_path(key);
+        debug!("azure get: key={key:?} -> blob={blob_name:?}");
         let client = self.blob_client(&blob_name)?;
         match client.download(None).await {
             Ok(response) => {
+                debug!("azure get: cache HIT for {blob_name:?}");
                 let body = response
                     .into_body()
                     .collect()
@@ -196,9 +238,10 @@ impl Storage for AzureBlobCredentialCache {
             }
             Err(e) => {
                 if e.http_status() == Some(StatusCode::NotFound) {
+                    debug!("azure get: cache MISS for {blob_name:?} (404)");
                     Ok(super::cache::Cache::Miss)
                 } else {
-                    warn!("Azure blob get unexpected error: {:?}", e);
+                    warn!("azure get: unexpected error for {blob_name:?}: {e:?}");
                     Ok(super::cache::Cache::Miss)
                 }
             }
@@ -208,14 +251,18 @@ impl Storage for AzureBlobCredentialCache {
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         let start = std::time::Instant::now();
         let blob_name = self.blob_path(key);
+        debug!("azure put: key={key:?} -> blob={blob_name:?}");
         let client = self.blob_client(&blob_name)?;
         let data = entry.finish()?;
         let len = data.len() as u64;
+        debug!("azure put: uploading {len} bytes to {blob_name:?}");
         client
             .upload(RequestContent::from(data), true, len, None)
             .await
             .map_err(|e| anyhow!("Azure blob upload failed: {e}"))?;
-        Ok(start.elapsed())
+        let elapsed = start.elapsed();
+        debug!("azure put: upload complete in {elapsed:?}");
+        Ok(elapsed)
     }
 
     async fn check(&self) -> Result<CacheMode> {
@@ -225,30 +272,39 @@ impl Storage for AzureBlobCredentialCache {
         } else {
             format!("{}/{}", self.key_prefix, check_blob)
         };
+        debug!("azure check: probing read/write access via blob {blob_name:?}");
         let client = self.blob_client(&blob_name)?;
 
         // Check read capability
+        debug!("azure check: testing read access (get_properties)");
         match client.get_properties(None).await {
-            Ok(_) => {}
+            Ok(_) => {
+                debug!("azure check: read access confirmed (blob exists)");
+            }
             Err(e) => {
                 if e.http_status() == Some(StatusCode::NotFound) {
-                    // Not found is ok, means we can read
+                    debug!("azure check: read access confirmed (404 = container readable, blob absent)");
                 } else {
+                    debug!("azure check: read access FAILED: {e:?}");
                     bail!("Azure credential cache storage failed to read: {:?}", e);
                 }
             }
         }
 
         // Check write capability
+        debug!("azure check: testing write access (upload probe)");
         let data = b"Hello, World!".to_vec();
         let len = data.len() as u64;
         let can_write = match client
             .upload(RequestContent::from(data), true, len, None)
             .await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                debug!("azure check: write access confirmed");
+                true
+            }
             Err(e) => {
-                eprintln!("Azure credential cache write check failed: {e:?}");
+                debug!("azure check: write access FAILED: {e:?}");
                 false
             }
         };
@@ -258,7 +314,7 @@ impl Storage for AzureBlobCredentialCache {
         } else {
             CacheMode::ReadOnly
         };
-        debug!("Azure credential cache check result: {mode:?}");
+        debug!("azure check: final mode={mode:?}");
         Ok(mode)
     }
 

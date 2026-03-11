@@ -843,10 +843,29 @@ fn config_from_env() -> Result<EnvConfig> {
 
     // ======= Azure =======
     let azure = if let Ok(container) = env::var("SCCACHE_AZURE_BLOB_CONTAINER") {
+        debug!("azure config: SCCACHE_AZURE_BLOB_CONTAINER={container:?}");
         let connection_string = env::var("SCCACHE_AZURE_CONNECTION_STRING").ok();
+        debug!(
+            "azure config: SCCACHE_AZURE_CONNECTION_STRING={}",
+            if connection_string.is_some() { "<set>" } else { "<not set>" }
+        );
         let storage_account_endpoint = env::var("SCCACHE_AZURE_BLOB_ENDPOINT").ok();
+        debug!(
+            "azure config: SCCACHE_AZURE_BLOB_ENDPOINT={}",
+            storage_account_endpoint.as_deref().unwrap_or("<not set>")
+        );
+        // Log credential-chain env vars (values redacted for security)
+        for var in &["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_CLIENT_SECRET"] {
+            debug!(
+                "azure config: {}={}",
+                var,
+                if env::var(var).is_ok() { "<set>" } else { "<not set>" }
+            );
+        }
         if connection_string.is_some() || storage_account_endpoint.is_some() {
             let key_prefix = key_prefix_from_env_var("SCCACHE_AZURE_KEY_PREFIX");
+            debug!("azure config: SCCACHE_AZURE_KEY_PREFIX={key_prefix:?}");
+            debug!("azure config: Azure cache config assembled successfully");
             Some(AzureCacheConfig {
                 connection_string,
                 container,
@@ -854,9 +873,11 @@ fn config_from_env() -> Result<EnvConfig> {
                 storage_account_endpoint,
             })
         } else {
+            debug!("azure config: neither SCCACHE_AZURE_CONNECTION_STRING nor SCCACHE_AZURE_BLOB_ENDPOINT set — Azure cache disabled");
             None
         }
     } else {
+        debug!("azure config: SCCACHE_AZURE_BLOB_CONTAINER not set — Azure cache disabled");
         None
     };
 
