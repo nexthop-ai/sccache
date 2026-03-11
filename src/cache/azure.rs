@@ -102,8 +102,19 @@ impl ChainedCredential {
         }
 
         // Try managed identity
-        debug!("azure credentials: attempting ManagedIdentityCredential");
-        match azure_identity::ManagedIdentityCredential::new(None) {
+        let mi_options = if has_client_id {
+            debug!("azure credentials: attempting ManagedIdentityCredential with client_id");
+            Some(azure_identity::ManagedIdentityCredentialOptions {
+                user_assigned_id: Some(azure_identity::UserAssignedId::ClientId(
+                    std::env::var("AZURE_CLIENT_ID").unwrap(),
+                )),
+                ..Default::default()
+            })
+        } else {
+            debug!("azure credentials: attempting ManagedIdentityCredential (system-assigned)");
+            None
+        };
+        match azure_identity::ManagedIdentityCredential::new(mi_options) {
             Ok(cred) => {
                 debug!("azure credentials: ManagedIdentityCredential added to chain");
                 sources.push(cred);
