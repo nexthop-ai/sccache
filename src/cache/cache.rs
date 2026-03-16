@@ -580,7 +580,9 @@ pub fn storage_from_config(
                     debug!("azure init: AzureBlobCache built successfully");
                     return Ok(Arc::new(storage));
                 } else if let Some(endpoint) = storage_account_endpoint {
-                    debug!("azure init: using credential-chain backend (AzureBlobCredentialCache), endpoint={endpoint:?}");
+                    debug!(
+                        "azure init: using credential-chain backend (AzureBlobCredentialCache), endpoint={endpoint:?}"
+                    );
                     let storage = AzureBlobCredentialCache::build(endpoint, container, key_prefix)
                         .map_err(|err| anyhow!("create azure credential cache failed: {err:?}"))?;
                     debug!("azure init: AzureBlobCredentialCache built successfully");

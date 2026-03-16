@@ -79,7 +79,11 @@ impl ChainedCredential {
             "azure credentials: AZURE_CLIENT_ID={}, AZURE_TENANT_ID={}, AZURE_CLIENT_SECRET={}",
             if has_client_id { "<set>" } else { "<not set>" },
             if has_tenant_id { "<set>" } else { "<not set>" },
-            if has_client_secret { "<set>" } else { "<not set>" },
+            if has_client_secret {
+                "<set>"
+            } else {
+                "<not set>"
+            },
         );
         if has_client_id && has_tenant_id && has_client_secret {
             debug!("azure credentials: attempting ClientSecretCredential");
@@ -192,7 +196,9 @@ impl AzureBlobCredentialCache {
     /// Create a new credential-based cache, initialising the `ChainedCredential`
     /// that will be shared across all blob operations for this session.
     pub fn build(endpoint: &str, container: &str, key_prefix: &str) -> Result<Self> {
-        debug!("azure build: endpoint={endpoint:?}, container={container:?}, key_prefix={key_prefix:?}");
+        debug!(
+            "azure build: endpoint={endpoint:?}, container={container:?}, key_prefix={key_prefix:?}"
+        );
         let credential = ChainedCredential::new()?;
         debug!("azure build: credential chain ready");
         Ok(Self {
@@ -294,7 +300,9 @@ impl Storage for AzureBlobCredentialCache {
             }
             Err(e) => {
                 if e.http_status() == Some(StatusCode::NotFound) {
-                    debug!("azure check: read access confirmed (404 = container readable, blob absent)");
+                    debug!(
+                        "azure check: read access confirmed (404 = container readable, blob absent)"
+                    );
                 } else {
                     debug!("azure check: read access FAILED: {e:?}");
                     bail!("Azure credential cache storage failed to read: {:?}", e);

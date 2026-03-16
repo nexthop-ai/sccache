@@ -847,7 +847,11 @@ fn config_from_env() -> Result<EnvConfig> {
         let connection_string = env::var("SCCACHE_AZURE_CONNECTION_STRING").ok();
         debug!(
             "azure config: SCCACHE_AZURE_CONNECTION_STRING={}",
-            if connection_string.is_some() { "<set>" } else { "<not set>" }
+            if connection_string.is_some() {
+                "<set>"
+            } else {
+                "<not set>"
+            }
         );
         let storage_account_endpoint = env::var("SCCACHE_AZURE_BLOB_ENDPOINT").ok();
         debug!(
@@ -859,7 +863,11 @@ fn config_from_env() -> Result<EnvConfig> {
             debug!(
                 "azure config: {}={}",
                 var,
-                if env::var(var).is_ok() { "<set>" } else { "<not set>" }
+                if env::var(var).is_ok() {
+                    "<set>"
+                } else {
+                    "<not set>"
+                }
             );
         }
         if connection_string.is_some() || storage_account_endpoint.is_some() {
@@ -873,7 +881,9 @@ fn config_from_env() -> Result<EnvConfig> {
                 storage_account_endpoint,
             })
         } else {
-            debug!("azure config: neither SCCACHE_AZURE_CONNECTION_STRING nor SCCACHE_AZURE_BLOB_ENDPOINT set — Azure cache disabled");
+            debug!(
+                "azure config: neither SCCACHE_AZURE_CONNECTION_STRING nor SCCACHE_AZURE_BLOB_ENDPOINT set — Azure cache disabled"
+            );
             None
         }
     } else {
