@@ -324,11 +324,12 @@ impl Storage for AzureBlobCredentialCache {
             }
             Err(e) => {
                 let status = e.http_status();
-                if status == Some(StatusCode::Forbidden)
-                    || status == Some(StatusCode::Unauthorized)
+                if status == Some(StatusCode::Forbidden) || status == Some(StatusCode::Unauthorized)
                 {
                     // Permission denied — degrade to read-only.
-                    debug!("azure check: write access denied ({status:?}), falling back to read-only");
+                    debug!(
+                        "azure check: write access denied ({status:?}), falling back to read-only"
+                    );
                     false
                 } else {
                     // Unexpected error (server error, network issue, etc.) — report it.
