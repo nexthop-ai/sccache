@@ -216,9 +216,10 @@ The full url appears then as `redis://user:passwd@1.2.3.4:6379/?db=1`.
 
 #### azure
 
-* `SCCACHE_AZURE_CONNECTION_STRING`
-* `SCCACHE_AZURE_BLOB_CONTAINER`
-* `SCCACHE_AZURE_KEY_PREFIX`
+* `SCCACHE_AZURE_CONNECTION_STRING` connection string for Azure Blob Storage (optional if using `SCCACHE_AZURE_BLOB_ENDPOINT`)
+* `SCCACHE_AZURE_BLOB_CONTAINER` the container name (required)
+* `SCCACHE_AZURE_KEY_PREFIX` prefix for cache keys (optional)
+* `SCCACHE_AZURE_BLOB_ENDPOINT` the storage account blob endpoint, e.g. `https://myaccount.blob.core.windows.net` (optional, enables `DefaultAzureCredential` authentication)
 
 #### gha
 

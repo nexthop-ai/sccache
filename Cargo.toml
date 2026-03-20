@@ -27,6 +27,9 @@ strip = true
 anyhow = { version = "1.0", features = ["backtrace"] }
 ar = "0.9"
 async-trait = "0.1"
+azure_core = { version = "0.31", optional = true }
+azure_identity = { version = "0.31", optional = true }
+azure_storage_blob = { version = "0.8", optional = true }
 backon = { version = "1", default-features = false, features = [
   "std-blocking-sleep",
 ] }
@@ -164,7 +167,14 @@ all = [
   "webdav",
   "oss",
 ]
-azure = ["opendal/services-azblob", "reqsign", "reqwest"]
+azure = [
+  "opendal/services-azblob",
+  "reqsign",
+  "reqwest",
+  "azure_identity",
+  "azure_storage_blob",
+  "azure_core",
+]
 default = ["all"]
 gcs = ["opendal/services-gcs", "reqsign", "url", "reqwest"]
 gha = ["opendal/services-ghac", "reqwest"]
