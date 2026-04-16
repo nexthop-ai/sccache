@@ -18,9 +18,10 @@ pub use self::server::Server;
 #[cfg(feature = "dist-server")]
 pub use self::server::{
     ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
+    create_https_cert_and_privkey,
 };
 
-mod common {
+pub mod common {
     use reqwest::header;
     use serde::{Deserialize, Serialize};
     #[cfg(feature = "dist-server")]
@@ -312,7 +313,7 @@ mod server {
         }
     }
 
-    fn create_https_cert_and_privkey(addr: SocketAddr) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    pub fn create_https_cert_and_privkey(addr: SocketAddr) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let rsa_key = openssl::rsa::Rsa::<openssl::pkey::Private>::generate(2048)
             .context("failed to generate rsa privkey")?;
         let privkey_pem = rsa_key

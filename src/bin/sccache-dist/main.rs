@@ -562,8 +562,30 @@ impl SchedulerIncoming for Scheduler {
         };
 
         {
-            // LOCKS
+            // LOCKS (alphabetical order to avoid deadlock)
             let mut jobs = self.jobs.lock().unwrap();
+            let servers = self.servers.lock().unwrap();
+
+            // A nonce-mismatch heartbeat (worker restart) may have replaced
+            // the ServerDetails while do_assign_job was in flight, clearing
+            // jobs_assigned. If so, self.jobs must not be populated — the job
+            // is orphaned and the client should retry.
+            if !servers
+                .get(&server_id)
+                .is_some_and(|s| s.jobs_assigned.contains(&job_id))
+            {
+                warn!(
+                    "Job {} was cleared from server {:?} during assignment \
+                     (likely a server restart); client should retry",
+                    job_id, server_id
+                );
+                return Ok(AllocJobResult::CommunicationError {
+                    msg: format!(
+                        "Server {:?} was replaced during job assignment",
+                        server_id
+                    ),
+                });
+            }
 
             info!(
                 "Job {} successfully assigned and saved with state {:?}",
@@ -865,3 +887,4 @@ impl ServerIncoming for Server {
         res
     }
 }
+
