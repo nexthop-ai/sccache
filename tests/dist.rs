@@ -551,12 +551,8 @@ fn test_dist_worker_restart_during_alloc() {
     let server_addr = match &server_handle {
         harness::ServerHandle::Process { url, .. } => {
             let u = url.to_url();
-            SocketAddr::from_str(&format!(
-                "{}:{}",
-                u.host_str().unwrap(),
-                u.port().unwrap()
-            ))
-            .unwrap()
+            SocketAddr::from_str(&format!("{}:{}", u.host_str().unwrap(), u.port().unwrap()))
+                .unwrap()
         }
         _ => panic!("expected Process handle"),
     };
@@ -567,21 +563,23 @@ fn test_dist_worker_restart_during_alloc() {
     // Spawn a thread to POST alloc_job — it will block while the worker's
     // handle_assign_job is parked.
     let alloc_url = dist::http::urls::scheduler_alloc_job(&scheduler_url);
-    let alloc_handle = thread::spawn(move || -> Result<dist::http::common::AllocJobHttpResponse> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .unwrap();
-        let tc = Toolchain {
-            archive_id: "tc".into(),
-        };
-        bincode_post(
-            &client,
-            alloc_url,
-            sccache::config::INSECURE_DIST_CLIENT_TOKEN,
-            &tc,
-        )
-    });
+    let alloc_handle = thread::spawn(
+        move || -> Result<dist::http::common::AllocJobHttpResponse> {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap();
+            let tc = Toolchain {
+                archive_id: "tc".into(),
+            };
+            bincode_post(
+                &client,
+                alloc_url,
+                sccache::config::INSECURE_DIST_CLIENT_TOKEN,
+                &tc,
+            )
+        },
+    );
 
     // Wait until the worker has entered handle_assign_job — at this point the
     // scheduler has inserted into server.jobs_assigned and dropped the servers
@@ -632,8 +630,10 @@ fn test_dist_worker_restart_during_alloc() {
             eprintln!("alloc_job correctly returned CommunicationError");
         }
         dist::http::common::AllocJobHttpResponse::Success { .. } => {
-            panic!("expected CommunicationError, got Success — scheduler inserted into \
-                    self.jobs despite jobs_assigned being cleared");
+            panic!(
+                "expected CommunicationError, got Success — scheduler inserted into \
+                    self.jobs despite jobs_assigned being cleared"
+            );
         }
         dist::http::common::AllocJobHttpResponse::Fail { msg } => {
             panic!("unexpected Fail: {msg}");

@@ -580,10 +580,7 @@ impl SchedulerIncoming for Scheduler {
                     job_id, server_id
                 );
                 return Ok(AllocJobResult::CommunicationError {
-                    msg: format!(
-                        "Server {:?} was replaced during job assignment",
-                        server_id
-                    ),
+                    msg: format!("Server {:?} was replaced during job assignment", server_id),
                 });
             }
 
@@ -887,4 +884,3 @@ impl ServerIncoming for Server {
         res
     }
 }
-
