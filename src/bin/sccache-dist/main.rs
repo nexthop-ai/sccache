@@ -572,7 +572,7 @@ impl SchedulerIncoming for Scheduler {
         };
 
         {
-            // LOCKS (alphabetical order to avoid deadlock)
+            // LOCKS
             let mut jobs = self.jobs.lock().unwrap();
 
             if let Some(detail) = jobs.get_mut(&job_id) {
