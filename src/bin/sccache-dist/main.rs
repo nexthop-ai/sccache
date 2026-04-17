@@ -438,7 +438,8 @@ impl SchedulerIncoming for Scheduler {
         tc: Toolchain,
     ) -> Result<AllocJobResult> {
         let (job_id, server_id, auth) = {
-            // LOCKS
+            // LOCKS (alphabetical order to avoid deadlock)
+            let mut jobs = self.jobs.lock().unwrap();
             let mut servers = self.servers.lock().unwrap();
 
             let res = {
@@ -502,6 +503,16 @@ impl SchedulerIncoming for Scheduler {
                             .insert(job_id, Instant::now())
                             .is_none()
                     );
+                    assert!(
+                        jobs.insert(
+                            job_id,
+                            JobDetail {
+                                server_id,
+                                state: JobState::Pending
+                            }
+                        )
+                        .is_none()
+                    );
 
                     info!(
                         "Job {} created and will be assigned to server {:?}",
@@ -532,16 +543,15 @@ impl SchedulerIncoming for Scheduler {
         let assign_result = requester
             .do_assign_job(server_id, job_id, tc, auth.clone())
             .with_context(|| {
-                // LOCKS
+                // LOCKS (alphabetical order to avoid deadlock)
+                let mut jobs = self.jobs.lock().unwrap();
                 let mut servers = self.servers.lock().unwrap();
+                jobs.remove(&job_id);
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
                     entry.jobs_unclaimed.remove(&job_id);
-                    if !entry.jobs_assigned.remove(&job_id) {
-                        "assign job failed and job not known to the server"
-                    } else {
-                        "assign job failed, job un-assigned from the server"
-                    }
+                    entry.jobs_assigned.remove(&job_id);
+                    "assign job failed, job un-assigned from the server"
                 } else {
                     "assign job failed and server not known"
                 }
@@ -564,34 +574,24 @@ impl SchedulerIncoming for Scheduler {
         {
             // LOCKS (alphabetical order to avoid deadlock)
             let mut jobs = self.jobs.lock().unwrap();
-            let servers = self.servers.lock().unwrap();
 
-            // A nonce-mismatch heartbeat (worker restart) may have replaced
-            // the ServerDetails while do_assign_job was in flight, clearing
-            // jobs_assigned. If so, self.jobs must not be populated — the job
-            // is orphaned and the client should retry.
-            if !servers
-                .get(&server_id)
-                .is_some_and(|s| s.jobs_assigned.contains(&job_id))
-            {
+            if let Some(detail) = jobs.get_mut(&job_id) {
+                detail.state = state;
+                info!(
+                    "Job {} successfully assigned with state {:?}",
+                    job_id, state
+                );
+            } else {
+                // Heartbeat cleaned up both maps during the RPC — client should retry
                 warn!(
-                    "Job {} was cleared from server {:?} during assignment \
-                     (likely a server restart); client should retry",
-                    job_id, server_id
+                    "Job {} was cleared during assignment (likely a server restart); \
+                     client should retry",
+                    job_id
                 );
                 return Ok(AllocJobResult::CommunicationError {
                     msg: format!("Server {:?} was replaced during job assignment", server_id),
                 });
             }
-
-            info!(
-                "Job {} successfully assigned and saved with state {:?}",
-                job_id, state
-            );
-            assert!(
-                jobs.insert(job_id, JobDetail { server_id, state })
-                    .is_none()
-            );
         }
         let job_alloc = JobAlloc {
             auth,
