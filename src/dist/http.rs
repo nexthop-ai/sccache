@@ -15,10 +15,11 @@
 pub use self::client::{Client, ClientConfig};
 #[cfg(feature = "dist-server")]
 pub use self::server::Server;
+#[cfg(feature = "dist-tests")]
+pub use self::server::create_https_cert_and_privkey;
 #[cfg(feature = "dist-server")]
 pub use self::server::{
     ClientAuthCheck, ClientVisibleMsg, HEARTBEAT_TIMEOUT, Scheduler, ServerAuthCheck,
-    create_https_cert_and_privkey,
 };
 
 pub mod common {

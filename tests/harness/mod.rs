@@ -34,7 +34,7 @@ const DIST_IMAGE_BWRAP_PATH: &str = "/usr/bin/bwrap";
 const MAX_STARTUP_WAIT: Duration = Duration::from_secs(5);
 const DIST_CACHE_RELPATH: &str = "client-dist-cache";
 
-const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
+pub const DIST_SERVER_TOKEN: &str = "THIS IS THE TEST TOKEN";
 
 const CONFIGS_CONTAINER_PATH: &str = "/sccache-bits";
 const BUILD_DIR_CONTAINER_PATH: &str = "/sccache-bits/build-dir";
@@ -233,7 +233,7 @@ fn sccache_server_cfg(
 // TODO: this is copied from the sccache-dist binary - it's not clear where would be a better place to put the
 // code so that it can be included here
 #[cfg(feature = "dist-server")]
-fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
+pub fn create_server_token(server_id: ServerId, auth_token: &str) -> String {
     format!("{} {}", server_id.addr(), auth_token)
 }
 

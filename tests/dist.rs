@@ -449,75 +449,74 @@ fn test_dist_toolchain() {
     });
 }
 
-// A worker that blocks in handle_assign_job until a file appears, giving the
-// test a window to send a nonce-mismatch heartbeat to the scheduler.
-struct SlowServer {
-    entered_path: PathBuf,
-    proceed_path: PathBuf,
-}
-impl ServerIncoming for SlowServer {
-    fn handle_assign_job(&self, _job_id: JobId, _tc: Toolchain) -> Result<AssignJobResult> {
-        std::fs::File::create(&self.entered_path).unwrap();
-        while !self.proceed_path.exists() {
-            thread::sleep(Duration::from_millis(50));
+#[cfg(feature = "dist-tests")]
+mod nonce_race_test {
+    use super::*;
+
+    // A worker that blocks in handle_assign_job until a file appears, giving the
+    // test a window to send a nonce-mismatch heartbeat to the scheduler.
+    pub struct SlowServer {
+        pub entered_path: PathBuf,
+        pub proceed_path: PathBuf,
+    }
+    impl ServerIncoming for SlowServer {
+        fn handle_assign_job(&self, _job_id: JobId, _tc: Toolchain) -> Result<AssignJobResult> {
+            std::fs::File::create(&self.entered_path).unwrap();
+            while !self.proceed_path.exists() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(AssignJobResult {
+                state: JobState::Ready,
+                need_toolchain: false,
+            })
         }
-        Ok(AssignJobResult {
-            state: JobState::Ready,
-            need_toolchain: false,
-        })
+        fn handle_submit_toolchain(
+            &self,
+            _requester: &dyn ServerOutgoing,
+            _job_id: JobId,
+            _tc_rdr: ToolchainReader,
+        ) -> Result<SubmitToolchainResult> {
+            panic!("should not have submitted toolchain")
+        }
+        fn handle_run_job(
+            &self,
+            requester: &dyn ServerOutgoing,
+            job_id: JobId,
+            _command: CompileCommand,
+            _outputs: Vec<String>,
+            _inputs_rdr: InputsReader,
+        ) -> Result<RunJobResult> {
+            requester
+                .do_update_job_state(job_id, JobState::Started)
+                .context("Updating job state failed")?;
+            requester
+                .do_update_job_state(job_id, JobState::Complete)
+                .context("Updating job state failed")?;
+            bail!("intentional failure after state updates")
+        }
     }
-    fn handle_submit_toolchain(
-        &self,
-        _requester: &dyn ServerOutgoing,
-        _job_id: JobId,
-        _tc_rdr: ToolchainReader,
-    ) -> Result<SubmitToolchainResult> {
-        panic!("should not have submitted toolchain")
-    }
-    fn handle_run_job(
-        &self,
-        requester: &dyn ServerOutgoing,
-        job_id: JobId,
-        _command: CompileCommand,
-        _outputs: Vec<String>,
-        _inputs_rdr: InputsReader,
-    ) -> Result<RunJobResult> {
-        requester
-            .do_update_job_state(job_id, JobState::Started)
-            .context("Updating job state failed")?;
-        requester
-            .do_update_job_state(job_id, JobState::Complete)
-            .context("Updating job state failed")?;
-        bail!("intentional failure after state updates")
-    }
-}
 
-fn bincode_post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
-    client: &reqwest::blocking::Client,
-    url: reqwest::Url,
-    auth: &str,
-    body: &T,
-) -> Result<R> {
-    let bytes = bincode::serialize(body).context("serialize")?;
-    let res = client
-        .post(url)
-        .bearer_auth(auth)
-        .header("content-type", "application/octet-stream")
-        .header("content-length", bytes.len())
-        .header("connection", "close")
-        .body(bytes)
-        .send()
-        .context("send")?;
-    if !res.status().is_success() {
-        bail!("HTTP {}", res.status());
+    pub fn bincode_post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        client: &reqwest::blocking::Client,
+        url: reqwest::Url,
+        auth: &str,
+        body: &T,
+    ) -> Result<R> {
+        let bytes = bincode::serialize(body).context("serialize")?;
+        let res = client
+            .post(url)
+            .bearer_auth(auth)
+            .header("content-type", "application/octet-stream")
+            .header("content-length", bytes.len())
+            .header("connection", "close")
+            .body(bytes)
+            .send()
+            .context("send")?;
+        if !res.status().is_success() {
+            bail!("HTTP {}", res.status());
+        }
+        bincode::deserialize_from(res).map_err(Into::into)
     }
-    bincode::deserialize_from(res).map_err(Into::into)
-}
-
-const DIST_SERVER_TOKEN_2: &str = "THIS IS THE TEST TOKEN";
-
-fn create_server_token(server_id: dist::ServerId, auth_token: &str) -> String {
-    format!("{} {}", server_id.addr(), auth_token)
 }
 
 /// Demonstrates the race between handle_alloc_job's two-phase insert and a
@@ -527,8 +526,8 @@ fn create_server_token(server_id: dist::ServerId, auth_token: &str) -> String {
 /// jobs_assigned). The scheduler then inserts into self.jobs, leaving the two
 /// maps permanently inconsistent. The next Complete transition panics at
 /// `assert!(entry.jobs_assigned.remove(&job_id))`, poisoning both mutexes.
+#[cfg(feature = "dist-tests")]
 #[test]
-#[cfg_attr(not(feature = "dist-tests"), ignore)]
 fn test_dist_worker_restart_during_alloc() {
     let tmpdir = tempfile::Builder::new()
         .prefix("sccache_dist_race_test")
@@ -543,7 +542,7 @@ fn test_dist_worker_restart_during_alloc() {
     let entered_path = tmpdir.join("assign_entered");
     let proceed_path = tmpdir.join("assign_proceed");
 
-    let slow_server = SlowServer {
+    let slow_server = nonce_race_test::SlowServer {
         entered_path: entered_path.clone(),
         proceed_path: proceed_path.clone(),
     };
@@ -557,7 +556,7 @@ fn test_dist_worker_restart_during_alloc() {
         _ => panic!("expected Process handle"),
     };
     let server_id = dist::ServerId::new(server_addr);
-    let server_token = create_server_token(server_id, DIST_SERVER_TOKEN_2);
+    let server_token = harness::create_server_token(server_id, harness::DIST_SERVER_TOKEN);
     let scheduler_url = system.scheduler_url().to_url();
 
     // Spawn a thread to POST alloc_job — it will block while the worker's
@@ -572,7 +571,7 @@ fn test_dist_worker_restart_during_alloc() {
             let tc = Toolchain {
                 archive_id: "tc".into(),
             };
-            bincode_post(
+            nonce_race_test::bincode_post(
                 &client,
                 alloc_url,
                 sccache::config::INSECURE_DIST_CLIENT_TOKEN,
@@ -612,7 +611,8 @@ fn test_dist_worker_restart_during_alloc() {
         .build()
         .unwrap();
     let hb_result: HeartbeatServerResult =
-        bincode_post(&client, hb_url, &server_token, &heartbeat).expect("heartbeat failed");
+        nonce_race_test::bincode_post(&client, hb_url, &server_token, &heartbeat)
+            .expect("heartbeat failed");
     assert!(
         hb_result.is_new,
         "expected nonce-mismatch to register as new server"
