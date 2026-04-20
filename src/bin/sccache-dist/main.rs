@@ -582,10 +582,10 @@ impl SchedulerIncoming for Scheduler {
                     job_id, state
                 );
             } else {
-                // Heartbeat cleaned up both maps during the RPC — client should retry
+                // Heartbeat cleaned up both maps during the RPC
                 warn!(
                     "Job {} was cleared during assignment (likely a server restart); \
-                     client should retry",
+                     client will fall back to local compilation",
                     job_id
                 );
                 return Ok(AllocJobResult::CommunicationError {
