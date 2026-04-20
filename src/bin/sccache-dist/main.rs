@@ -438,7 +438,8 @@ impl SchedulerIncoming for Scheduler {
         tc: Toolchain,
     ) -> Result<AllocJobResult> {
         let (job_id, server_id, auth) = {
-            // LOCKS
+            // LOCKS (alphabetical order to avoid deadlock)
+            let mut jobs = self.jobs.lock().unwrap();
             let mut servers = self.servers.lock().unwrap();
 
             let res = {
@@ -502,6 +503,16 @@ impl SchedulerIncoming for Scheduler {
                             .insert(job_id, Instant::now())
                             .is_none()
                     );
+                    assert!(
+                        jobs.insert(
+                            job_id,
+                            JobDetail {
+                                server_id,
+                                state: JobState::Pending
+                            }
+                        )
+                        .is_none()
+                    );
 
                     info!(
                         "Job {} created and will be assigned to server {:?}",
@@ -532,16 +543,15 @@ impl SchedulerIncoming for Scheduler {
         let assign_result = requester
             .do_assign_job(server_id, job_id, tc, auth.clone())
             .with_context(|| {
-                // LOCKS
+                // LOCKS (alphabetical order to avoid deadlock)
+                let mut jobs = self.jobs.lock().unwrap();
                 let mut servers = self.servers.lock().unwrap();
+                jobs.remove(&job_id);
                 if let Some(entry) = servers.get_mut(&server_id) {
                     entry.last_error = Some(Instant::now());
                     entry.jobs_unclaimed.remove(&job_id);
-                    if !entry.jobs_assigned.remove(&job_id) {
-                        "assign job failed and job not known to the server"
-                    } else {
-                        "assign job failed, job un-assigned from the server"
-                    }
+                    entry.jobs_assigned.remove(&job_id);
+                    "assign job failed, job un-assigned from the server"
                 } else {
                     "assign job failed and server not known"
                 }
@@ -565,14 +575,23 @@ impl SchedulerIncoming for Scheduler {
             // LOCKS
             let mut jobs = self.jobs.lock().unwrap();
 
-            info!(
-                "Job {} successfully assigned and saved with state {:?}",
-                job_id, state
-            );
-            assert!(
-                jobs.insert(job_id, JobDetail { server_id, state })
-                    .is_none()
-            );
+            if let Some(detail) = jobs.get_mut(&job_id) {
+                detail.state = state;
+                info!(
+                    "Job {} successfully assigned with state {:?}",
+                    job_id, state
+                );
+            } else {
+                // Heartbeat cleaned up both maps during the RPC
+                warn!(
+                    "Job {} was cleared during assignment (likely a server restart); \
+                     client will fall back to local compilation (if enabled)",
+                    job_id
+                );
+                return Ok(AllocJobResult::CommunicationError {
+                    msg: format!("Server {:?} was replaced during job assignment", server_id),
+                });
+            }
         }
         let job_alloc = JobAlloc {
             auth,
