@@ -6,11 +6,63 @@ on:
       - main
 
 jobs:
-  build-and-release:
-    name: Build and Release Latest
+  build:
+    name: Build ${{ matrix.binary }} ${{ matrix.target }}
     runs-on: ubuntu-22.04
-    container: 
-      image: messense/rust-musl-cross:x86_64-musl
+    container:
+      image: ${{ matrix.container_image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binary: sccache
+            target: x86_64-unknown-linux-musl
+            container_image: messense/rust-musl-cross:x86_64-musl
+            extra_args: ""
+          - binary: sccache-dist
+            target: x86_64-unknown-linux-musl
+            container_image: messense/rust-musl-cross:x86_64-musl
+            extra_args: --no-default-features --features=dist-server
+          - binary: sccache
+            target: aarch64-unknown-linux-musl
+            container_image: messense/rust-musl-cross:aarch64-musl
+            extra_args: ""
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v5
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(cargo pkgid | cut -d# -f2 | cut -d: -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install zstd
+        run: |
+          apt-get update
+          apt-get install -y zstd
+
+      - name: Build static binary
+        run: |
+          cargo build --locked --release --bin ${{ matrix.binary }} --target ${{ matrix.target }} --features=openssl/vendored ${{ matrix.extra_args }}
+          ASSET=${{ matrix.binary }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zst
+          zstd -T0 -19 target/${{ matrix.target }}/release/${{ matrix.binary }} -o "$ASSET"
+          sha256sum "$ASSET" > "$ASSET.sha256"
+        env:
+          CARGO_PROFILE_RELEASE_LTO: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.target }}
+          path: |
+            ${{ matrix.binary }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zst
+            ${{ matrix.binary }}-${{ steps.version.outputs.version }}-${{ matrix.target }}.zst.sha256
+
+  release:
+    name: Create or Update Release
+    needs: build
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
@@ -22,31 +74,12 @@ jobs:
         run: |
           VERSION=$(cargo pkgid | cut -d# -f2 | cut -d: -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Extracted version: $VERSION"
 
-      - name: Install zstd
-        run: |
-          apt-get update
-          apt-get install -y zstd
-
-      - name: Build static binary
-        run: |
-          cargo build --locked --release --bin sccache --target x86_64-unknown-linux-musl --features=openssl/vendored
-          zstd -T0 -19 target/x86_64-unknown-linux-musl/release/sccache -o sccache-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst
-          cargo build --locked --release --no-default-features --features="dist-server" --bin sccache-dist --target x86_64-unknown-linux-musl --features=openssl/vendored
-          zstd -T0 -19 target/x86_64-unknown-linux-musl/release/sccache-dist -o sccache-dist-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst
-        env:
-          CARGO_PROFILE_RELEASE_LTO: true
-
-      - name: Verify binaries
-        run: |
-          target/x86_64-unknown-linux-musl/release/sccache --help
-          target/x86_64-unknown-linux-musl/release/sccache-dist --help
-
-      - name: Generate SHA256 checksum
-        run: |
-          sha256sum sccache-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst > sccache-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst.sha256
-          sha256sum sccache-dist-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst > sccache-dist-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst.sha256
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Create or Update Latest Release
         uses: softprops/action-gh-release@v1
@@ -59,12 +92,8 @@ jobs:
             Commit: ${{ github.sha }}
             Build Date: ${{ github.event.head_commit.timestamp }}
 
-            This is an automatically generated release with static x86_64-unknown-linux-musl binaries.
-          files: |
-            sccache-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst
-            sccache-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst.sha256
-            sccache-dist-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst
-            sccache-dist-${{ steps.version.outputs.version }}-x86_64-unknown-linux-musl.zst.sha256
+            Automatically generated release with static Linux musl binaries for x86_64 and aarch64.
+          files: artifacts/*
           prerelease: true
           draft: false
         env:
