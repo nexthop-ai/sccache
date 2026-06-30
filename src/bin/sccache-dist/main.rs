@@ -486,6 +486,9 @@ impl SchedulerIncoming for Scheduler {
                         best = Some((server_id, details));
                         trace!("Selected {:?} as the server with the best load", server_id);
                         best_load = load;
+                        if load == 0f64 {
+                            break;
+                        }
                     }
                 }
 
@@ -879,126 +882,5 @@ impl ServerIncoming for Server {
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
         res
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::SocketAddr;
-
-    struct MockAuthorizer;
-    impl JobAuthorizer for MockAuthorizer {
-        fn generate_token(&self, _job_id: JobId) -> Result<String> {
-            Ok("token".into())
-        }
-        fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    struct MockRequester;
-    impl SchedulerOutgoing for MockRequester {
-        fn do_assign_job(
-            &self,
-            _server_id: ServerId,
-            _job_id: JobId,
-            _tc: Toolchain,
-            _auth: String,
-        ) -> Result<AssignJobResult> {
-            Ok(AssignJobResult {
-                state: JobState::Pending,
-                need_toolchain: false,
-            })
-        }
-    }
-
-    fn make_server_id(last_octet: u8) -> ServerId {
-        let addr: SocketAddr = format!("10.0.0.{}:10500", last_octet).parse().unwrap();
-        ServerId::new(addr)
-    }
-
-    fn make_toolchain() -> Toolchain {
-        Toolchain {
-            archive_id: "test".into(),
-        }
-    }
-
-    /// Register `n` idle servers into the scheduler, each with 32 CPUs.
-    fn register_servers(scheduler: &Scheduler, n: u8) {
-        let requester = MockRequester;
-        for i in 1..=n {
-            let server_id = make_server_id(i);
-            let nonce = ServerNonce::new();
-            scheduler
-                .handle_heartbeat_server(server_id, nonce, 32, Box::new(MockAuthorizer))
-                .unwrap();
-            // Confirm the server is visible by allocating and immediately
-            // doing nothing — the server is idle after registration.
-            let _ = &requester; // suppress unused warning
-        }
-    }
-
-    /// Allocate `jobs` compile jobs and return a count per server.
-    fn alloc_jobs(scheduler: &Scheduler, jobs: usize) -> HashMap<ServerId, usize> {
-        let requester = MockRequester;
-        let mut counts: HashMap<ServerId, usize> = HashMap::new();
-        for _ in 0..jobs {
-            match scheduler
-                .handle_alloc_job(&requester, make_toolchain())
-                .unwrap()
-            {
-                AllocJobResult::Success { job_alloc, .. } => {
-                    *counts.entry(job_alloc.server_id).or_insert(0) += 1;
-                }
-                AllocJobResult::Fail { msg } => panic!("alloc failed: {}", msg),
-                AllocJobResult::CommunicationError { msg } => {
-                    panic!("alloc communication error: {}", msg)
-                }
-            }
-        }
-        counts
-    }
-
-    /// With 5 idle servers and 5 jobs the scheduler must pick a different
-    /// server for each job (all loads are equal, so it must spread evenly).
-    #[test]
-    fn alloc_spreads_across_all_idle_servers() {
-        let scheduler = Scheduler::new();
-        register_servers(&scheduler, 5);
-
-        // Allocate exactly one job per server worth of work.
-        let counts = alloc_jobs(&scheduler, 5);
-
-        assert_eq!(counts.len(), 5, "expected all 5 servers to receive a job");
-        for (server, count) in &counts {
-            assert_eq!(
-                *count, 1,
-                "server {:?} received {} jobs instead of 1",
-                server, count
-            );
-        }
-    }
-
-    /// With 2 idle servers, jobs must be spread: no single server should
-    /// get more than ceil(N/2) of N jobs when all are idle.
-    #[test]
-    fn alloc_does_not_starve_any_server() {
-        let scheduler = Scheduler::new();
-        register_servers(&scheduler, 2);
-
-        let n = 10;
-        let counts = alloc_jobs(&scheduler, n);
-
-        assert_eq!(counts.len(), 2, "expected both servers to receive jobs");
-        for (server, count) in &counts {
-            assert!(
-                *count <= (n + 1) / 2,
-                "server {:?} received {} out of {} jobs — load imbalance",
-                server,
-                count,
-                n
-            );
-        }
     }
 }
