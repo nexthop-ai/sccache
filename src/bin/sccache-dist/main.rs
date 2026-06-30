@@ -370,6 +370,7 @@ struct ServerDetails {
     jobs_assigned_total: u64,
     jobs_completed_total: u64,
     jobs_evicted_total: u64,
+    started_jobs_evicted_total: u64,
 }
 
 impl Scheduler {
@@ -641,6 +642,7 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
 
                 let mut stale_jobs = Vec::new();
+                let mut started_timeout_evictions: u64 = 0;
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
                     if now.duration_since(last_seen) < UNCLAIMED_READY_TIMEOUT {
                         continue;
@@ -668,6 +670,7 @@ impl SchedulerIncoming for Scheduler {
                                         now.duration_since(last_seen)
                                     );
                                     stale_jobs.push(job_id);
+                                    started_timeout_evictions += 1;
                                 }
                             }
                             state => {
@@ -685,6 +688,8 @@ impl SchedulerIncoming for Scheduler {
                         "The following stale jobs will be de-allocated: {:?}",
                         stale_jobs
                     );
+
+                    details.started_jobs_evicted_total += started_timeout_evictions;
 
                     for job_id in stale_jobs {
                         if !details.jobs_assigned.remove(&job_id) {
@@ -741,6 +746,7 @@ impl SchedulerIncoming for Scheduler {
                 jobs_assigned_total: 0,
                 jobs_completed_total: 0,
                 jobs_evicted_total: 0,
+                started_jobs_evicted_total: 0,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
@@ -905,6 +911,16 @@ impl SchedulerIncoming for Scheduler {
                 "sccache_scheduler_worker_jobs_evicted_total{{worker=\"{}\"}} {}\n",
                 server_id.addr(),
                 details.jobs_evicted_total,
+            ));
+        }
+
+        out.push_str("# HELP sccache_scheduler_worker_started_jobs_evicted_total Total number of Started jobs evicted from a worker for exceeding STARTED_JOB_TIMEOUT without reporting completion\n");
+        out.push_str("# TYPE sccache_scheduler_worker_started_jobs_evicted_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_started_jobs_evicted_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.started_jobs_evicted_total,
             ));
         }
 
