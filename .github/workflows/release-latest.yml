@@ -2,8 +2,9 @@ name: Release Latest
 
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -84,17 +85,17 @@ jobs:
       - name: Create or Update Latest Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Release v${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           body: |
-            Release v${{ steps.version.outputs.version }} from main branch
+            Release ${{ github.ref_name }} from main branch
 
             Commit: ${{ github.sha }}
             Build Date: ${{ github.event.head_commit.timestamp }}
 
             Automatically generated release with static Linux musl binaries for x86_64 and aarch64.
           files: artifacts/*
-          prerelease: true
+          prerelease: false
           draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
