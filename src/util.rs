@@ -406,7 +406,7 @@ pub fn fmt_duration_as_secs(duration: &Duration) -> String {
 /// Returns a duration between 500ms and 2^attempt seconds (capped at 30s).
 pub fn retry_backoff(attempt: u32) -> Duration {
     use rand::Rng;
-    let max_secs = 2_u64.pow(attempt).min(30);
+    let max_secs = 2_u64.saturating_pow(attempt).min(30);
     let millis = rand::thread_rng().gen_range(500..=(max_secs * 1000));
     Duration::from_millis(millis)
 }
@@ -1133,6 +1133,24 @@ mod tests {
         assert!(!finder.found_timestamp());
         finder.find_time_macros(b"TIMESTAMP__ This is larger than the haystack");
         assert!(finder.found_timestamp());
+    }
+
+    #[test]
+    fn test_retry_backoff_no_panic_on_large_attempt() {
+        // Regression test: when attempt >= 64, 2_u64.pow(attempt) overflows to 0
+        // in release mode, making gen_range(500..=0) panic with "cannot sample
+        // empty range". saturating_pow prevents this by yielding u64::MAX instead.
+        for attempt in [0u32, 1, 5, 30, 63, 64, 100, u32::MAX] {
+            let d = super::retry_backoff(attempt);
+            assert!(
+                d >= std::time::Duration::from_millis(500),
+                "attempt {attempt}: backoff {d:?} below 500ms minimum"
+            );
+            assert!(
+                d <= std::time::Duration::from_millis(30_000),
+                "attempt {attempt}: backoff {d:?} exceeds 30s maximum"
+            );
+        }
     }
 
     #[test]
