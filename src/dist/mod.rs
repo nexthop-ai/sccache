@@ -678,6 +678,7 @@ pub trait SchedulerIncoming: Send + Sync {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
+        running_jobs: Vec<JobId>,
     ) -> ExtResult<HeartbeatServerResult, Error>;
     // From Server
     fn handle_update_job_state(
@@ -712,6 +713,10 @@ pub trait ServerIncoming: Send + Sync {
         outputs: Vec<String>,
         inputs_rdr: InputsReader<'_>,
     ) -> ExtResult<RunJobResult, Error>;
+    // Snapshot of jobs currently executing on this worker.  Included in each
+    // heartbeat so the scheduler can reconcile its view against ground truth
+    // and evict jobs whose Complete notification was lost.
+    fn running_jobs(&self) -> Vec<JobId>;
 }
 
 #[cfg(feature = "dist-server")]
