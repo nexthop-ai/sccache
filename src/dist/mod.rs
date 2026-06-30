@@ -688,6 +688,8 @@ pub trait SchedulerIncoming: Send + Sync {
     ) -> ExtResult<UpdateJobStateResult, Error>;
     // From anyone
     fn handle_status(&self) -> ExtResult<SchedulerStatusResult, Error>;
+    // From anyone - Prometheus text-format metrics
+    fn handle_metrics(&self) -> ExtResult<String, Error>;
 }
 
 #[cfg(feature = "dist-server")]

@@ -364,6 +364,9 @@ struct ServerDetails {
     num_cpus: usize,
     server_nonce: ServerNonce,
     job_authorizer: Box<dyn JobAuthorizer>,
+    // Monotonically increasing counters for Prometheus metrics.
+    jobs_assigned_total: u64,
+    jobs_completed_total: u64,
 }
 
 impl Scheduler {
@@ -502,6 +505,7 @@ impl SchedulerIncoming for Scheduler {
                     let job_count = self.job_count.fetch_add(1, Ordering::SeqCst) as u64;
                     let job_id = JobId(job_count);
                     assert!(server_details.jobs_assigned.insert(job_id));
+                    server_details.jobs_assigned_total += 1;
                     assert!(
                         server_details
                             .jobs_unclaimed
@@ -728,6 +732,8 @@ impl SchedulerIncoming for Scheduler {
                 num_cpus,
                 server_nonce,
                 job_authorizer,
+                jobs_assigned_total: 0,
+                jobs_completed_total: 0,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
@@ -779,6 +785,7 @@ impl SchedulerIncoming for Scheduler {
                         // Also remove from jobs_unclaimed; the normal path
                         // left it there to enable the Started-job timeout.
                         entry.jobs_unclaimed.remove(&job_id);
+                        entry.jobs_completed_total += 1;
                     } else {
                         bail!("Job was marked as finished, but server is not known to scheduler")
                     }
@@ -804,6 +811,35 @@ impl SchedulerIncoming for Scheduler {
             num_cpus: servers.values().map(|v| v.num_cpus).sum(),
             in_progress: jobs.len(),
         })
+    }
+
+    fn handle_metrics(&self) -> Result<String> {
+        // LOCKS
+        let servers = self.servers.lock().unwrap();
+
+        let mut out = String::new();
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_assigned_total Total number of jobs ever assigned to a worker\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_assigned_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_assigned_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_assigned_total,
+            ));
+        }
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_completed_total Total number of jobs completed successfully on a worker\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_completed_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_completed_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_completed_total,
+            ));
+        }
+
+        Ok(out)
     }
 }
 
