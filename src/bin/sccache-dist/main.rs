@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::env;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -331,6 +331,10 @@ const MAX_PER_CORE_LOAD: f64 = 2f64;
 const SERVER_REMEMBER_ERROR_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_PENDING_TIMEOUT: Duration = Duration::from_secs(300);
 const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
+// Maximum time a job may be in the Started (actively running) state before
+// being considered stuck and evicted.  Large C++ TUs can take several minutes,
+// so use a generous limit that is still finite.
+const STARTED_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
@@ -341,6 +345,8 @@ struct JobDetail {
 // To avoid deadlicking, make sure to do all locking at once (i.e. no further locking in a downward scope),
 // in alphabetical order
 pub struct Scheduler {
+    // Total number of times the scheduler returned "Insufficient capacity".
+    alloc_failures_total: AtomicU64,
     job_count: AtomicUsize,
 
     // Currently running jobs, can never be Complete
@@ -351,19 +357,26 @@ pub struct Scheduler {
 
 struct ServerDetails {
     jobs_assigned: HashSet<JobId>,
-    // Jobs assigned that haven't seen a state change. Can only be pending
-    // or ready.
+    // Jobs that are still in flight (Pending, Ready, or Started).  The
+    // Instant records when the job entered its current state so we can evict
+    // jobs that have been stuck too long.
     jobs_unclaimed: HashMap<JobId, Instant>,
     last_seen: Instant,
     last_error: Option<Instant>,
     num_cpus: usize,
     server_nonce: ServerNonce,
     job_authorizer: Box<dyn JobAuthorizer>,
+    // Monotonically increasing counters for Prometheus metrics.
+    jobs_assigned_total: u64,
+    jobs_completed_total: u64,
+    jobs_evicted_total: u64,
+    started_jobs_evicted_total: u64,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Scheduler {
+            alloc_failures_total: AtomicU64::new(0),
             job_count: AtomicUsize::new(0),
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
@@ -497,6 +510,7 @@ impl SchedulerIncoming for Scheduler {
                     let job_count = self.job_count.fetch_add(1, Ordering::SeqCst) as u64;
                     let job_id = JobId(job_count);
                     assert!(server_details.jobs_assigned.insert(job_id));
+                    server_details.jobs_assigned_total += 1;
                     assert!(
                         server_details
                             .jobs_unclaimed
@@ -531,6 +545,7 @@ impl SchedulerIncoming for Scheduler {
             if let Some(res) = res {
                 res
             } else {
+                self.alloc_failures_total.fetch_add(1, Ordering::Relaxed);
                 let msg = format!(
                     "Insufficient capacity across {} available servers",
                     servers.len()
@@ -627,6 +642,7 @@ impl SchedulerIncoming for Scheduler {
                 details.last_seen = now;
 
                 let mut stale_jobs = Vec::new();
+                let mut started_timeout_evictions: u64 = 0;
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
                     if now.duration_since(last_seen) < UNCLAIMED_READY_TIMEOUT {
                         continue;
@@ -639,6 +655,22 @@ impl SchedulerIncoming for Scheduler {
                             JobState::Pending => {
                                 if now.duration_since(last_seen) > UNCLAIMED_PENDING_TIMEOUT {
                                     stale_jobs.push(job_id);
+                                }
+                            }
+                            JobState::Started => {
+                                // A Started job whose completion was never
+                                // reported (client crash, network failure)
+                                // would stay in jobs_assigned forever without
+                                // this timeout.
+                                if now.duration_since(last_seen) > STARTED_JOB_TIMEOUT {
+                                    warn!(
+                                        "Job {} on server {} has been running for {:?}, evicting",
+                                        job_id,
+                                        server_id.addr(),
+                                        now.duration_since(last_seen)
+                                    );
+                                    stale_jobs.push(job_id);
+                                    started_timeout_evictions += 1;
                                 }
                             }
                             state => {
@@ -656,6 +688,8 @@ impl SchedulerIncoming for Scheduler {
                         "The following stale jobs will be de-allocated: {:?}",
                         stale_jobs
                     );
+
+                    details.started_jobs_evicted_total += started_timeout_evictions;
 
                     for job_id in stale_jobs {
                         if !details.jobs_assigned.remove(&job_id) {
@@ -679,6 +713,7 @@ impl SchedulerIncoming for Scheduler {
                                 job_id
                             );
                         }
+                        details.jobs_evicted_total += 1;
                     }
                 }
 
@@ -708,6 +743,10 @@ impl SchedulerIncoming for Scheduler {
                 num_cpus,
                 server_nonce,
                 job_authorizer,
+                jobs_assigned_total: 0,
+                jobs_completed_total: 0,
+                jobs_evicted_total: 0,
+                started_jobs_evicted_total: 0,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
@@ -743,7 +782,10 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Pending, JobState::Ready) => entry.get_mut().state = job_state,
                 (JobState::Ready, JobState::Started) => {
                     if let Some(details) = server_details {
-                        details.jobs_unclaimed.remove(&job_id);
+                        // Refresh the timestamp so the Started-job timeout is
+                        // measured from when execution actually began, not from
+                        // when the job was first assigned.
+                        details.jobs_unclaimed.insert(job_id, Instant::now());
                     } else {
                         warn!("Job state updated, but server is not known to scheduler")
                     }
@@ -752,7 +794,11 @@ impl SchedulerIncoming for Scheduler {
                 (JobState::Started, JobState::Complete) => {
                     let (job_id, _) = entry.remove_entry();
                     if let Some(entry) = server_details {
-                        assert!(entry.jobs_assigned.remove(&job_id))
+                        assert!(entry.jobs_assigned.remove(&job_id));
+                        // Also remove from jobs_unclaimed; the normal path
+                        // left it there to enable the Started-job timeout.
+                        entry.jobs_unclaimed.remove(&job_id);
+                        entry.jobs_completed_total += 1;
                     } else {
                         bail!("Job was marked as finished, but server is not known to scheduler")
                     }
@@ -778,6 +824,107 @@ impl SchedulerIncoming for Scheduler {
             num_cpus: servers.values().map(|v| v.num_cpus).sum(),
             in_progress: jobs.len(),
         })
+    }
+
+    fn handle_metrics(&self) -> Result<String> {
+        // LOCKS (alphabetical order)
+        let jobs = self.jobs.lock().unwrap();
+        let servers = self.servers.lock().unwrap();
+
+        let mut out = String::new();
+
+        // --- Scheduler-wide counters ---
+
+        out.push_str("# HELP sccache_scheduler_alloc_failures_total Number of times the scheduler rejected a job request due to insufficient capacity\n");
+        out.push_str("# TYPE sccache_scheduler_alloc_failures_total counter\n");
+        out.push_str(&format!(
+            "sccache_scheduler_alloc_failures_total {}\n",
+            self.alloc_failures_total.load(Ordering::Relaxed),
+        ));
+
+        // --- Scheduler-wide gauges ---
+
+        out.push_str("# HELP sccache_scheduler_workers_total Number of workers currently registered with the scheduler\n");
+        out.push_str("# TYPE sccache_scheduler_workers_total gauge\n");
+        out.push_str(&format!(
+            "sccache_scheduler_workers_total {}\n",
+            servers.len(),
+        ));
+
+        out.push_str("# HELP sccache_scheduler_jobs_in_flight Current number of in-flight jobs across all workers\n");
+        out.push_str("# TYPE sccache_scheduler_jobs_in_flight gauge\n");
+        out.push_str(&format!(
+            "sccache_scheduler_jobs_in_flight {}\n",
+            jobs.len(),
+        ));
+
+        // --- Per-worker gauges ---
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_in_flight Current number of in-flight jobs on a worker\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_in_flight gauge\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_in_flight{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_assigned.len(),
+            ));
+        }
+
+        out.push_str(
+            "# HELP sccache_scheduler_worker_num_cpus Number of CPUs reported by a worker\n",
+        );
+        out.push_str("# TYPE sccache_scheduler_worker_num_cpus gauge\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_num_cpus{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.num_cpus,
+            ));
+        }
+
+        // --- Per-worker counters ---
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_assigned_total Total number of jobs ever assigned to a worker\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_assigned_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_assigned_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_assigned_total,
+            ));
+        }
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_completed_total Total number of jobs completed successfully on a worker\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_completed_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_completed_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_completed_total,
+            ));
+        }
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_evicted_total Total number of stale jobs evicted from a worker by the heartbeat timeout\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_evicted_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_evicted_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_evicted_total,
+            ));
+        }
+
+        out.push_str("# HELP sccache_scheduler_worker_started_jobs_evicted_total Total number of Started jobs evicted from a worker for exceeding STARTED_JOB_TIMEOUT without reporting completion\n");
+        out.push_str("# TYPE sccache_scheduler_worker_started_jobs_evicted_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_started_jobs_evicted_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.started_jobs_evicted_total,
+            ));
+        }
+
+        Ok(out)
     }
 }
 
@@ -882,5 +1029,128 @@ impl ServerIncoming for Server {
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
         res
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    struct MockAuthorizer;
+    impl JobAuthorizer for MockAuthorizer {
+        fn generate_token(&self, _job_id: JobId) -> Result<String> {
+            Ok("token".into())
+        }
+        fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockRequester;
+    impl SchedulerOutgoing for MockRequester {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            Ok(AssignJobResult {
+                state: JobState::Pending,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    fn make_server_id(last_octet: u8) -> ServerId {
+        let addr: SocketAddr = format!("10.0.0.{}:10500", last_octet).parse().unwrap();
+        ServerId::new(addr)
+    }
+
+    fn make_toolchain() -> Toolchain {
+        Toolchain {
+            archive_id: "test".into(),
+        }
+    }
+
+    /// A job stuck in the Started state (client crashed, network failure after
+    /// execution began) must not leak in jobs_assigned forever.
+    ///
+    /// Without the fix: Ready→Started removes the job from jobs_unclaimed,
+    /// making heartbeat-based eviction permanently impossible.
+    ///
+    /// With the fix: the job stays in jobs_unclaimed (timestamp refreshed on
+    /// Started entry) so the heartbeat evicts it after STARTED_JOB_TIMEOUT.
+    #[test]
+    fn started_job_is_evicted_by_heartbeat_after_timeout() {
+        let scheduler = Scheduler::new();
+        let server_id = make_server_id(1);
+        let nonce = ServerNonce::new();
+        scheduler
+            .handle_heartbeat_server(server_id, nonce.clone(), 32, Box::new(MockAuthorizer))
+            .unwrap();
+
+        // Advance a job to Started without completing it, simulating a client
+        // crash or network failure that prevents the Complete notification.
+        let job_id = match scheduler
+            .handle_alloc_job(&MockRequester, make_toolchain())
+            .unwrap()
+        {
+            AllocJobResult::Success { job_alloc, .. } => job_alloc.job_id,
+            _ => panic!("expected AllocJobResult::Success"),
+        };
+        scheduler
+            .handle_update_job_state(job_id, server_id, JobState::Ready)
+            .unwrap();
+        scheduler
+            .handle_update_job_state(job_id, server_id, JobState::Started)
+            .unwrap();
+
+        // After transitioning to Started, the job must still be present in
+        // jobs_unclaimed.  Without the fix, the old code removed it here,
+        // making all subsequent heartbeats unable to evict it.
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let details = servers.get(&server_id).unwrap();
+            assert!(
+                details.jobs_unclaimed.contains_key(&job_id),
+                "Started job must remain in jobs_unclaimed to enable \
+                 timeout-based eviction via heartbeat"
+            );
+        }
+
+        // Simulate STARTED_JOB_TIMEOUT having elapsed by backdating the
+        // jobs_unclaimed entry.  The test requires the system to have been
+        // running for at least STARTED_JOB_TIMEOUT (10 min).
+        {
+            let mut servers = scheduler.servers.lock().unwrap();
+            let details = servers.get_mut(&server_id).unwrap();
+            for ts in details.jobs_unclaimed.values_mut() {
+                *ts = ts
+                    .checked_sub(STARTED_JOB_TIMEOUT + Duration::from_secs(1))
+                    .expect(
+                        "system uptime < STARTED_JOB_TIMEOUT; \
+                             this test requires at least 10 minutes of uptime",
+                    );
+            }
+        }
+
+        // A heartbeat fires the stale-job cleanup.
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 32, Box::new(MockAuthorizer))
+            .unwrap();
+
+        // The zombie Started job must have been removed from both sets.
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(&server_id).unwrap();
+        assert!(
+            details.jobs_assigned.is_empty(),
+            "zombie Started job must be evicted from jobs_assigned by heartbeat"
+        );
+        assert!(
+            details.jobs_unclaimed.is_empty(),
+            "zombie Started job must be evicted from jobs_unclaimed by heartbeat"
+        );
     }
 }

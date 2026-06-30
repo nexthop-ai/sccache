@@ -852,6 +852,10 @@ mod server {
                         let res: SchedulerStatusResult = try_or_500_log!(req_id, handler.handle_status());
                         prepare_response(request, &res)
                     },
+                    (GET) (/api/v1/scheduler/metrics) => {
+                        let body: String = try_or_500_log!(req_id, handler.handle_metrics());
+                        rouille::Response::text(body)
+                    },
                     _ => {
                         warn!("Unknown request {:?}", request);
                         rouille::Response::empty_404()
