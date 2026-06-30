@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, btree_map};
 use std::env;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -345,6 +345,8 @@ struct JobDetail {
 // To avoid deadlicking, make sure to do all locking at once (i.e. no further locking in a downward scope),
 // in alphabetical order
 pub struct Scheduler {
+    // Total number of times the scheduler returned "Insufficient capacity".
+    alloc_failures_total: AtomicU64,
     job_count: AtomicUsize,
 
     // Currently running jobs, can never be Complete
@@ -367,11 +369,13 @@ struct ServerDetails {
     // Monotonically increasing counters for Prometheus metrics.
     jobs_assigned_total: u64,
     jobs_completed_total: u64,
+    jobs_evicted_total: u64,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Scheduler {
+            alloc_failures_total: AtomicU64::new(0),
             job_count: AtomicUsize::new(0),
             jobs: Mutex::new(BTreeMap::new()),
             servers: Mutex::new(HashMap::new()),
@@ -540,6 +544,7 @@ impl SchedulerIncoming for Scheduler {
             if let Some(res) = res {
                 res
             } else {
+                self.alloc_failures_total.fetch_add(1, Ordering::Relaxed);
                 let msg = format!(
                     "Insufficient capacity across {} available servers",
                     servers.len()
@@ -703,6 +708,7 @@ impl SchedulerIncoming for Scheduler {
                                 job_id
                             );
                         }
+                        details.jobs_evicted_total += 1;
                     }
                 }
 
@@ -734,6 +740,7 @@ impl SchedulerIncoming for Scheduler {
                 job_authorizer,
                 jobs_assigned_total: 0,
                 jobs_completed_total: 0,
+                jobs_evicted_total: 0,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
@@ -814,10 +821,62 @@ impl SchedulerIncoming for Scheduler {
     }
 
     fn handle_metrics(&self) -> Result<String> {
-        // LOCKS
+        // LOCKS (alphabetical order)
+        let jobs = self.jobs.lock().unwrap();
         let servers = self.servers.lock().unwrap();
 
         let mut out = String::new();
+
+        // --- Scheduler-wide counters ---
+
+        out.push_str("# HELP sccache_scheduler_alloc_failures_total Number of times the scheduler rejected a job request due to insufficient capacity\n");
+        out.push_str("# TYPE sccache_scheduler_alloc_failures_total counter\n");
+        out.push_str(&format!(
+            "sccache_scheduler_alloc_failures_total {}\n",
+            self.alloc_failures_total.load(Ordering::Relaxed),
+        ));
+
+        // --- Scheduler-wide gauges ---
+
+        out.push_str("# HELP sccache_scheduler_workers_total Number of workers currently registered with the scheduler\n");
+        out.push_str("# TYPE sccache_scheduler_workers_total gauge\n");
+        out.push_str(&format!(
+            "sccache_scheduler_workers_total {}\n",
+            servers.len(),
+        ));
+
+        out.push_str("# HELP sccache_scheduler_jobs_in_flight Current number of in-flight jobs across all workers\n");
+        out.push_str("# TYPE sccache_scheduler_jobs_in_flight gauge\n");
+        out.push_str(&format!(
+            "sccache_scheduler_jobs_in_flight {}\n",
+            jobs.len(),
+        ));
+
+        // --- Per-worker gauges ---
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_in_flight Current number of in-flight jobs on a worker\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_in_flight gauge\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_in_flight{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_assigned.len(),
+            ));
+        }
+
+        out.push_str(
+            "# HELP sccache_scheduler_worker_num_cpus Number of CPUs reported by a worker\n",
+        );
+        out.push_str("# TYPE sccache_scheduler_worker_num_cpus gauge\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_num_cpus{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.num_cpus,
+            ));
+        }
+
+        // --- Per-worker counters ---
 
         out.push_str("# HELP sccache_scheduler_worker_jobs_assigned_total Total number of jobs ever assigned to a worker\n");
         out.push_str("# TYPE sccache_scheduler_worker_jobs_assigned_total counter\n");
@@ -836,6 +895,16 @@ impl SchedulerIncoming for Scheduler {
                 "sccache_scheduler_worker_jobs_completed_total{{worker=\"{}\"}} {}\n",
                 server_id.addr(),
                 details.jobs_completed_total,
+            ));
+        }
+
+        out.push_str("# HELP sccache_scheduler_worker_jobs_evicted_total Total number of stale jobs evicted from a worker by the heartbeat timeout\n");
+        out.push_str("# TYPE sccache_scheduler_worker_jobs_evicted_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_jobs_evicted_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.jobs_evicted_total,
             ));
         }
 
