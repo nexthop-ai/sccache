@@ -166,6 +166,11 @@ pub mod common {
         pub server_nonce: dist::ServerNonce,
         pub cert_digest: Vec<u8>,
         pub cert_pem: Vec<u8>,
+        // Jobs the worker is currently executing.  Used by the scheduler to
+        // reconcile its view: any job it thinks is Started on this worker but
+        // that is not in this list has lost its Complete notification and is
+        // evicted immediately rather than waiting for STARTED_JOB_TIMEOUT.
+        pub running_jobs: Vec<dist::JobId>,
     }
     // cert_pem is quite long so elide it (you can retrieve it by hitting the server url anyway)
     impl fmt::Debug for HeartbeatServerHttpRequest {
@@ -176,15 +181,17 @@ pub mod common {
                 server_nonce,
                 cert_digest,
                 cert_pem,
+                running_jobs,
             } = self;
             write!(
                 f,
-                "HeartbeatServerHttpRequest {{ jwt_key: {:?}, num_cpus: {:?}, server_nonce: {:?}, cert_digest: {:?}, cert_pem: [...{} bytes...] }}",
+                "HeartbeatServerHttpRequest {{ jwt_key: {:?}, num_cpus: {:?}, server_nonce: {:?}, cert_digest: {:?}, cert_pem: [...{} bytes...], running_jobs: {:?} }}",
                 jwt_key,
                 num_cpus,
                 server_nonce,
                 cert_digest,
-                cert_pem.len()
+                cert_pem.len(),
+                running_jobs,
             )
         }
     }
@@ -824,7 +831,7 @@ mod server {
                         let heartbeat_server = try_or_400_log!(req_id, bincode_input(request));
                         trace!(target: "sccache_heartbeat", "Req {}: heartbeat_server: {:?}", req_id, heartbeat_server);
 
-                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem } = heartbeat_server;
+                        let HeartbeatServerHttpRequest { num_cpus, jwt_key, server_nonce, cert_digest, cert_pem, running_jobs } = heartbeat_server;
                         try_or_500_log!(req_id, maybe_update_certs(
                             &mut requester.client.lock().unwrap(),
                             &mut server_certificates.lock().unwrap(),
@@ -834,7 +841,8 @@ mod server {
                         let res: HeartbeatServerResult = try_or_500_log!(req_id, handler.handle_heartbeat_server(
                             server_id, server_nonce,
                             num_cpus,
-                            job_authorizer
+                            job_authorizer,
+                            running_jobs,
                         ));
                         prepare_response(request, &res)
                     },
@@ -949,12 +957,13 @@ mod server {
                 server_nonce,
                 handler,
             } = self;
-            let heartbeat_req = HeartbeatServerHttpRequest {
+            let mut heartbeat_req = HeartbeatServerHttpRequest {
                 num_cpus: num_cpus(),
                 jwt_key: jwt_key.clone(),
                 server_nonce,
                 cert_digest,
                 cert_pem: cert_pem.clone(),
+                running_jobs: Vec::new(),
             };
             let job_authorizer = JWTJobAuthorizer::new(jwt_key);
             let heartbeat_url = urls::scheduler_heartbeat_server(&scheduler_url);
@@ -963,11 +972,14 @@ mod server {
                 scheduler_url,
                 scheduler_auth: scheduler_auth.clone(),
             };
+            let handler = std::sync::Arc::new(handler);
+            let handler_heartbeat = handler.clone();
 
             // TODO: detect if this panics
             thread::spawn(move || {
                 let client = new_reqwest_blocking_client();
                 loop {
+                    heartbeat_req.running_jobs = handler_heartbeat.running_jobs();
                     trace!(target: "sccache_heartbeat", "Performing heartbeat");
                     match bincode_req(
                         client
