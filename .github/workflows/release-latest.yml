@@ -30,13 +30,22 @@ jobs:
             extra_args: ""
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Extract version from Cargo.toml
         id: version
         run: |
           VERSION=$(cargo pkgid | cut -d# -f2 | cut -d: -f2)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Compute git describe override
+        id: gitdescribe
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${GITHUB_SHA:0:8}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Install zstd
         run: |
@@ -51,9 +60,10 @@ jobs:
           sha256sum "$ASSET" > "$ASSET.sha256"
         env:
           CARGO_PROFILE_RELEASE_LTO: true
+          SCCACHE_GIT_DESCRIBE_OVERRIDE: ${{ steps.gitdescribe.outputs.value }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.binary }}-${{ matrix.target }}
           path: |
@@ -68,7 +78,7 @@ jobs:
       contents: write
     steps:
       - name: Clone repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Extract version from Cargo.toml
         id: version
@@ -77,13 +87,13 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
 
       - name: Create or Update Latest Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
