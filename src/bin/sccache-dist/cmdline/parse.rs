@@ -109,6 +109,12 @@ fn get_clap_command() -> ClapCommand {
 
     ClapCommand::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("SCCACHE_GIT_DESCRIBE"),
+            ")"
+        ))
         .subcommand_required(true)
         .subcommand(
             ClapCommand::new("auth")

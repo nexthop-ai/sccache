@@ -99,6 +99,12 @@ fn flag_infer_long(name: &'static str) -> Arg {
 fn get_clap_command() -> clap::Command {
     clap::Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
+        .long_version(concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("SCCACHE_GIT_DESCRIBE"),
+            ")"
+        ))
         .max_term_width(110)
         .after_help(concat!(
             "Enabled features:\n",
