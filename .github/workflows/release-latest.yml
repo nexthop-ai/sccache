@@ -40,12 +40,17 @@ jobs:
 
       - name: Compute git describe override
         id: gitdescribe
+        # Uses POSIX sh syntax (no bash-only `[[` / `${var:0:8}`), since the
+        # rust-musl-cross containers this job runs in default to plain `sh`.
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo "value=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          else
-            echo "value=${GITHUB_SHA:0:8}" >> $GITHUB_OUTPUT
-          fi
+          case "$GITHUB_REF" in
+            refs/tags/*)
+              echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "value=$(echo "$GITHUB_SHA" | cut -c1-8)" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
       - name: Install zstd
         run: |
