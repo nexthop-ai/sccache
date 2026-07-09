@@ -335,6 +335,14 @@ const UNCLAIMED_READY_TIMEOUT: Duration = Duration::from_secs(60);
 // being considered stuck and evicted.  Large C++ TUs can take several minutes,
 // so use a generous limit that is still finite.
 const STARTED_JOB_TIMEOUT: Duration = Duration::from_secs(3600);
+// Minimum time a job must have been Started before heartbeat reconciliation
+// may evict it.  A worker's heartbeat snapshot of running_jobs can be sampled
+// just before a job registers itself and yet be delivered after the job's
+// Started notification is processed; without this grace period such a stale
+// snapshot would falsely evict a freshly started job.  One full heartbeat
+// cycle (30s) plus delivery slack guarantees any snapshot this old was
+// sampled after the job registered.
+const HEARTBEAT_RECONCILE_GRACE: Duration = Duration::from_secs(90);
 
 #[derive(Copy, Clone)]
 struct JobDetail {
@@ -371,6 +379,7 @@ struct ServerDetails {
     jobs_completed_total: u64,
     jobs_evicted_total: u64,
     started_jobs_evicted_total: u64,
+    reconcile_jobs_evicted_total: u64,
 }
 
 impl Scheduler {
@@ -625,6 +634,7 @@ impl SchedulerIncoming for Scheduler {
         server_nonce: ServerNonce,
         num_cpus: usize,
         job_authorizer: Box<dyn JobAuthorizer>,
+        running_jobs: Vec<JobId>,
     ) -> Result<HeartbeatServerResult> {
         if num_cpus == 0 {
             bail!("Invalid number of CPUs (0) specified in heartbeat")
@@ -641,16 +651,17 @@ impl SchedulerIncoming for Scheduler {
                 let now = Instant::now();
                 details.last_seen = now;
 
+                let reported_running: HashSet<JobId> = running_jobs.iter().copied().collect();
                 let mut stale_jobs = Vec::new();
                 let mut started_timeout_evictions: u64 = 0;
+                let mut reconcile_evictions: u64 = 0;
                 for (&job_id, &last_seen) in details.jobs_unclaimed.iter() {
-                    if now.duration_since(last_seen) < UNCLAIMED_READY_TIMEOUT {
-                        continue;
-                    }
                     if let Some(detail) = jobs.get(&job_id) {
                         match detail.state {
                             JobState::Ready => {
-                                stale_jobs.push(job_id);
+                                if now.duration_since(last_seen) > UNCLAIMED_READY_TIMEOUT {
+                                    stale_jobs.push(job_id);
+                                }
                             }
                             JobState::Pending => {
                                 if now.duration_since(last_seen) > UNCLAIMED_PENDING_TIMEOUT {
@@ -658,11 +669,24 @@ impl SchedulerIncoming for Scheduler {
                                 }
                             }
                             JobState::Started => {
-                                // A Started job whose completion was never
-                                // reported (client crash, network failure)
-                                // would stay in jobs_assigned forever without
-                                // this timeout.
-                                if now.duration_since(last_seen) > STARTED_JOB_TIMEOUT {
+                                // Fast path: the worker reports the jobs it is
+                                // actively executing.  Any Started job not in
+                                // that set lost its Complete notification.
+                                // The grace period skips jobs so young that a
+                                // stale in-flight snapshot (sampled before the
+                                // job registered) could still be delivered.
+                                if !reported_running.contains(&job_id)
+                                    && now.duration_since(last_seen) > HEARTBEAT_RECONCILE_GRACE
+                                {
+                                    warn!(
+                                        "Job {} on server {} not reported as running by worker, evicting",
+                                        job_id,
+                                        server_id.addr(),
+                                    );
+                                    stale_jobs.push(job_id);
+                                    reconcile_evictions += 1;
+                                } else if now.duration_since(last_seen) > STARTED_JOB_TIMEOUT {
+                                    // Backstop for a genuinely stuck build.
                                     warn!(
                                         "Job {} on server {} has been running for {:?}, evicting",
                                         job_id,
@@ -690,6 +714,7 @@ impl SchedulerIncoming for Scheduler {
                     );
 
                     details.started_jobs_evicted_total += started_timeout_evictions;
+                    details.reconcile_jobs_evicted_total += reconcile_evictions;
 
                     for job_id in stale_jobs {
                         if !details.jobs_assigned.remove(&job_id) {
@@ -747,6 +772,7 @@ impl SchedulerIncoming for Scheduler {
                 jobs_completed_total: 0,
                 jobs_evicted_total: 0,
                 started_jobs_evicted_total: 0,
+                reconcile_jobs_evicted_total: 0,
             },
         );
         Ok(HeartbeatServerResult { is_new: true })
@@ -904,7 +930,7 @@ impl SchedulerIncoming for Scheduler {
             ));
         }
 
-        out.push_str("# HELP sccache_scheduler_worker_jobs_evicted_total Total number of stale jobs evicted from a worker by the heartbeat timeout\n");
+        out.push_str("# HELP sccache_scheduler_worker_jobs_evicted_total Total number of stale jobs evicted from a worker for any reason during heartbeat processing\n");
         out.push_str("# TYPE sccache_scheduler_worker_jobs_evicted_total counter\n");
         for (server_id, details) in servers.iter() {
             out.push_str(&format!(
@@ -924,6 +950,16 @@ impl SchedulerIncoming for Scheduler {
             ));
         }
 
+        out.push_str("# HELP sccache_scheduler_worker_reconcile_jobs_evicted_total Total number of Started jobs evicted from a worker because the worker's heartbeat no longer reported them as running\n");
+        out.push_str("# TYPE sccache_scheduler_worker_reconcile_jobs_evicted_total counter\n");
+        for (server_id, details) in servers.iter() {
+            out.push_str(&format!(
+                "sccache_scheduler_worker_reconcile_jobs_evicted_total{{worker=\"{}\"}} {}\n",
+                server_id.addr(),
+                details.reconcile_jobs_evicted_total,
+            ));
+        }
+
         Ok(out)
     }
 }
@@ -932,6 +968,9 @@ pub struct Server {
     builder: Box<dyn BuilderIncoming>,
     cache: Mutex<TcCache>,
     job_toolchains: Mutex<HashMap<JobId, Toolchain>>,
+    // Jobs currently being executed by this worker.  Sampled by the heartbeat
+    // thread so the scheduler can reconcile its own view.
+    running_jobs: Mutex<HashSet<JobId>>,
 }
 
 impl Server {
@@ -946,7 +985,29 @@ impl Server {
             builder,
             cache: Mutex::new(cache),
             job_toolchains: Mutex::new(HashMap::new()),
+            running_jobs: Mutex::new(HashSet::new()),
         })
+    }
+}
+
+/// RAII guard that registers a job in `Server::running_jobs` on construction
+/// and removes it on drop.  Drop order guarantees the entry is cleared even if
+/// the build panics or returns early.
+struct RunningJobGuard<'a> {
+    set: &'a Mutex<HashSet<JobId>>,
+    job_id: JobId,
+}
+
+impl<'a> RunningJobGuard<'a> {
+    fn new(set: &'a Mutex<HashSet<JobId>>, job_id: JobId) -> Self {
+        set.lock().unwrap().insert(job_id);
+        Self { set, job_id }
+    }
+}
+
+impl Drop for RunningJobGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.job_id);
     }
 }
 
@@ -1006,6 +1067,11 @@ impl ServerIncoming for Server {
         outputs: Vec<String>,
         inputs_rdr: InputsReader,
     ) -> Result<RunJobResult> {
+        // Register the job in the running set BEFORE notifying the scheduler.
+        // Inverted ordering would create a window where the scheduler thinks
+        // the job is Started but the worker doesn't report it as running,
+        // tripping the heartbeat-reconciliation evictor.
+        let _running_guard = RunningJobGuard::new(&self.running_jobs, job_id);
         requester
             .do_update_job_state(job_id, JobState::Started)
             .context("Updating job state failed")?;
@@ -1029,6 +1095,10 @@ impl ServerIncoming for Server {
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
         res
+    }
+
+    fn running_jobs(&self) -> Vec<JobId> {
+        self.running_jobs.lock().unwrap().iter().copied().collect()
     }
 }
 
@@ -1088,7 +1158,13 @@ mod tests {
         let server_id = make_server_id(1);
         let nonce = ServerNonce::new();
         scheduler
-            .handle_heartbeat_server(server_id, nonce.clone(), 32, Box::new(MockAuthorizer))
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                32,
+                Box::new(MockAuthorizer),
+                vec![],
+            )
             .unwrap();
 
         // Advance a job to Started without completing it, simulating a client
@@ -1122,7 +1198,7 @@ mod tests {
 
         // Simulate STARTED_JOB_TIMEOUT having elapsed by backdating the
         // jobs_unclaimed entry.  The test requires the system to have been
-        // running for at least STARTED_JOB_TIMEOUT (10 min).
+        // running for at least STARTED_JOB_TIMEOUT (1 hour).
         {
             let mut servers = scheduler.servers.lock().unwrap();
             let details = servers.get_mut(&server_id).unwrap();
@@ -1131,14 +1207,17 @@ mod tests {
                     .checked_sub(STARTED_JOB_TIMEOUT + Duration::from_secs(1))
                     .expect(
                         "system uptime < STARTED_JOB_TIMEOUT; \
-                             this test requires at least 10 minutes of uptime",
+                             this test requires at least 1 hour of uptime",
                     );
             }
         }
 
-        // A heartbeat fires the stale-job cleanup.
+        // A heartbeat fires the stale-job cleanup.  The worker *does* still
+        // report the job as running here, isolating the test to the
+        // STARTED_JOB_TIMEOUT backstop path (heartbeat-reconciliation eviction
+        // is exercised separately below).
         scheduler
-            .handle_heartbeat_server(server_id, nonce, 32, Box::new(MockAuthorizer))
+            .handle_heartbeat_server(server_id, nonce, 32, Box::new(MockAuthorizer), vec![job_id])
             .unwrap();
 
         // The zombie Started job must have been removed from both sets.
@@ -1151,6 +1230,123 @@ mod tests {
         assert!(
             details.jobs_unclaimed.is_empty(),
             "zombie Started job must be evicted from jobs_unclaimed by heartbeat"
+        );
+        assert_eq!(
+            details.started_jobs_evicted_total, 1,
+            "timeout eviction must increment the STARTED_JOB_TIMEOUT counter"
+        );
+        assert_eq!(
+            details.reconcile_jobs_evicted_total, 0,
+            "timeout eviction must not increment the reconciliation counter"
+        );
+    }
+
+    /// Reconciliation path: when the worker reports its `running_jobs` set in
+    /// a heartbeat, the scheduler evicts any Started job it thinks is assigned
+    /// to that worker but that the worker no longer reports — once the job has
+    /// been Started for longer than HEARTBEAT_RECONCILE_GRACE.  This recovers
+    /// from a lost Complete notification in ~grace + one heartbeat interval
+    /// (~2 min) instead of waiting STARTED_JOB_TIMEOUT.
+    #[test]
+    fn started_job_is_evicted_by_heartbeat_reconciliation() {
+        let scheduler = Scheduler::new();
+        let server_id = make_server_id(2);
+        let nonce = ServerNonce::new();
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                32,
+                Box::new(MockAuthorizer),
+                vec![],
+            )
+            .unwrap();
+
+        let job_id = match scheduler
+            .handle_alloc_job(&MockRequester, make_toolchain())
+            .unwrap()
+        {
+            AllocJobResult::Success { job_alloc, .. } => job_alloc.job_id,
+            _ => panic!("expected AllocJobResult::Success"),
+        };
+        scheduler
+            .handle_update_job_state(job_id, server_id, JobState::Ready)
+            .unwrap();
+        scheduler
+            .handle_update_job_state(job_id, server_id, JobState::Started)
+            .unwrap();
+
+        // Sanity: scheduler thinks the job is in flight.
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let details = servers.get(&server_id).unwrap();
+            assert!(details.jobs_assigned.contains(&job_id));
+            assert!(details.jobs_unclaimed.contains_key(&job_id));
+        }
+
+        // A heartbeat with an EMPTY running set arriving while the job is
+        // still within HEARTBEAT_RECONCILE_GRACE must NOT evict it: the
+        // snapshot may have been sampled before the job registered itself and
+        // delivered after the Started notification (the stale-snapshot race).
+        scheduler
+            .handle_heartbeat_server(
+                server_id,
+                nonce.clone(),
+                32,
+                Box::new(MockAuthorizer),
+                vec![],
+            )
+            .unwrap();
+        {
+            let servers = scheduler.servers.lock().unwrap();
+            let details = servers.get(&server_id).unwrap();
+            assert!(
+                details.jobs_assigned.contains(&job_id),
+                "Started job within the reconcile grace period must not be evicted"
+            );
+        }
+
+        // Backdate the Started timestamp past the grace period (but far short
+        // of STARTED_JOB_TIMEOUT, proving eviction is driven by the worker's
+        // report and not by the timeout).
+        {
+            let mut servers = scheduler.servers.lock().unwrap();
+            let details = servers.get_mut(&server_id).unwrap();
+            let backdated = Instant::now()
+                .checked_sub(HEARTBEAT_RECONCILE_GRACE + Duration::from_secs(1))
+                .expect("system uptime < HEARTBEAT_RECONCILE_GRACE; cannot backdate Instant");
+            details.jobs_unclaimed.insert(job_id, backdated);
+        }
+
+        // Worker reports an EMPTY running set — it no longer believes this job
+        // is in flight, but the scheduler hasn't been told Complete.  Without
+        // the reconciliation logic the scheduler would carry the job until
+        // STARTED_JOB_TIMEOUT.
+        scheduler
+            .handle_heartbeat_server(server_id, nonce, 32, Box::new(MockAuthorizer), vec![])
+            .unwrap();
+
+        let servers = scheduler.servers.lock().unwrap();
+        let details = servers.get(&server_id).unwrap();
+        assert!(
+            details.jobs_assigned.is_empty(),
+            "Started job not reported by worker must be evicted via reconciliation"
+        );
+        assert!(
+            details.jobs_unclaimed.is_empty(),
+            "Started job not reported by worker must be cleared from jobs_unclaimed"
+        );
+        assert_eq!(
+            details.jobs_evicted_total, 1,
+            "reconciliation eviction must increment the eviction counter"
+        );
+        assert_eq!(
+            details.reconcile_jobs_evicted_total, 1,
+            "reconciliation eviction must increment the reconciliation counter"
+        );
+        assert_eq!(
+            details.started_jobs_evicted_total, 0,
+            "reconciliation eviction must not increment the STARTED_JOB_TIMEOUT counter"
         );
     }
 }

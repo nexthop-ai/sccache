@@ -242,6 +242,9 @@ impl ServerIncoming for FailingServer {
             .context("Updating job state failed")?;
         bail!("internal build failure")
     }
+    fn running_jobs(&self) -> Vec<JobId> {
+        Vec::new()
+    }
 }
 
 #[test]
