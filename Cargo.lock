@@ -3628,8 +3628,7 @@ dependencies = [
 [[package]]
 name = "tiny_http"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82"
+source = "git+https://github.com/nexthop-ai/tiny-http?rev=b12b28001523422febfe01f48138d1bb60adc886#b12b28001523422febfe01f48138d1bb60adc886"
 dependencies = [
  "ascii",
  "chunked_transfer",
