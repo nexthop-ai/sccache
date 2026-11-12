@@ -3165,6 +3165,259 @@ LLVM version: 6.0",
             assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
         }
     }
+
+    #[cfg(feature = "dist-client")]
+    const LOCAL_STDOUT: &[u8] = b"local stdout";
+
+    #[cfg(feature = "dist-client")]
+    struct DistCompileOutcome {
+        result: Result<(DistType, process::Output)>,
+        local_compile_ran: bool,
+        /// Elapsed time on a paused tokio clock, i.e. the total retry backoff.
+        backoff: Duration,
+    }
+
+    /// Run one compile of foo.c through `get_cached_or_compile` with
+    /// `dist_client`. A local compiler invocation is available in case the
+    /// dist compile falls back to it.
+    #[cfg(feature = "dist-client")]
+    fn compile_with_dist_client(dist_client: Arc<dyn dist::Client>) -> DistCompileOutcome {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        std::fs::write(f.tempdir.path().join("foo.c"), "whatever").unwrap();
+        let storage = Arc::new(DiskCache::new(
+            f.tempdir.path().join("cache"),
+            u64::MAX,
+            &pool,
+            PreprocessorCacheModeConfig::default(),
+            CacheMode::ReadWrite,
+        ));
+        // Pretend to be GCC.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        let c = get_compiler_info(
+            creator.clone(),
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+        // The preprocessor invocation.
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let local_compile_ran = Arc::new(AtomicBool::new(false));
+        let ran = local_compile_ran.clone();
+        let obj = f.tempdir.path().join("foo.o");
+        next_command_calls(&creator, move |_| {
+            ran.store(true, Ordering::SeqCst);
+            File::create(&obj)?.write_all(b"file contents")?;
+            Ok(MockChild::new(exit_status(0), LOCAL_STDOUT, ""))
+        });
+        let service = server::SccacheService::mock_with_dist_client(
+            dist_client.clone(),
+            storage.clone(),
+            pool.clone(),
+        );
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let mut hasher = match c.parse_arguments(&arguments, ".".as_ref(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        // With the clock paused, retry backoff sleeps return immediately but
+        // still advance tokio's clock.
+        let paused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (result, backoff) = paused.block_on(async {
+            let start = tokio::time::Instant::now();
+            let result = hasher
+                .get_cached_or_compile(
+                    &service,
+                    Some(dist_client),
+                    creator.clone(),
+                    storage,
+                    arguments,
+                    f.tempdir.path().to_path_buf(),
+                    vec![],
+                    CacheControl::ForceRecache,
+                    pool,
+                )
+                .await;
+            (result, start.elapsed())
+        });
+        let result = result.map(|(cached, output)| match cached {
+            CompileResult::CacheMiss(MissType::ForcedRecache, dist_type, _, write) => {
+                write.wait().unwrap();
+                (dist_type, output)
+            }
+            other => panic!("Unexpected compile result: {:?}", other),
+        });
+        DistCompileOutcome {
+            result,
+            local_compile_ran: local_compile_ran.load(Ordering::SeqCst),
+            backoff,
+        }
+    }
+
+    #[test_case(test_dist::DistFailure::AllocErr ; "alloc error")]
+    #[test_case(test_dist::DistFailure::AllocHttpClientErr ; "alloc http client error")]
+    #[test_case(test_dist::DistFailure::AllocFail ; "alloc fail")]
+    #[test_case(test_dist::DistFailure::AllocCommunicationError ; "alloc communication error")]
+    #[test_case(test_dist::DistFailure::SubmitErr ; "submit toolchain error")]
+    #[test_case(test_dist::DistFailure::SubmitJobNotFound ; "submit toolchain job not found")]
+    #[test_case(test_dist::DistFailure::SubmitCannotCache ; "submit toolchain cannot cache")]
+    #[test_case(test_dist::DistFailure::RunErr ; "run job error")]
+    #[test_case(test_dist::DistFailure::RunJobNotFound ; "run job not found")]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_remote_only_retries_until_success(failure: test_dist::DistFailure) {
+        use std::sync::atomic::Ordering;
+        const FAILURES: usize = 3;
+        let client = Arc::new(test_dist::ScriptedClient::new(true).fail_times(failure, FAILURES));
+        let outcome = compile_with_dist_client(client.clone());
+
+        let (dist_type, output) = outcome
+            .result
+            .expect("remote_only compile should succeed once the failures stop");
+        assert!(matches!(dist_type, DistType::Ok(_)), "{dist_type:?}");
+        assert_eq!(test_dist::REMOTE_STDOUT, output.stdout.as_slice());
+        assert!(!outcome.local_compile_ran);
+        assert_eq!(FAILURES + 1, client.calls_at(failure));
+        // Every retry starts over with a new job allocation.
+        assert_eq!(FAILURES + 1, client.alloc_calls.load(Ordering::SeqCst));
+        assert_eq!(1, client.put_toolchain_calls.load(Ordering::SeqCst));
+        assert!(
+            outcome.backoff >= Duration::from_millis(500) * FAILURES as u32,
+            "expected >= 500ms backoff per retry, got {:?}",
+            outcome.backoff
+        );
+    }
+
+    #[test_case(test_dist::DistFailure::AllocErr ; "alloc error")]
+    #[test_case(test_dist::DistFailure::AllocFail ; "alloc fail")]
+    #[test_case(test_dist::DistFailure::AllocCommunicationError ; "alloc communication error")]
+    #[test_case(test_dist::DistFailure::SubmitErr ; "submit toolchain error")]
+    #[test_case(test_dist::DistFailure::SubmitJobNotFound ; "submit toolchain job not found")]
+    #[test_case(test_dist::DistFailure::SubmitCannotCache ; "submit toolchain cannot cache")]
+    #[test_case(test_dist::DistFailure::RunErr ; "run job error")]
+    #[test_case(test_dist::DistFailure::RunJobNotFound ; "run job not found")]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_without_remote_only_falls_back_to_local(failure: test_dist::DistFailure) {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(test_dist::ScriptedClient::new(false).fail_times(failure, 1));
+        let outcome = compile_with_dist_client(client.clone());
+
+        let (dist_type, output) = outcome.result.expect("should fall back to a local compile");
+        assert_eq!(DistType::Error, dist_type);
+        assert_eq!(LOCAL_STDOUT, output.stdout.as_slice());
+        assert!(outcome.local_compile_ran);
+        assert_eq!(1, client.calls_at(failure));
+        assert_eq!(1, client.alloc_calls.load(Ordering::SeqCst));
+        assert_eq!(Duration::ZERO, outcome.backoff);
+    }
+
+    /// Errors outside the retry loop fail the compile under remote_only
+    /// instead of falling back.
+    #[test_case(true ; "remote_only")]
+    #[test_case(false ; "not remote_only")]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_put_toolchain_error(remote_only: bool) {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(
+            test_dist::ScriptedClient::new(remote_only)
+                .fail_put_toolchain(anyhow!("MOCK: put toolchain failure")),
+        );
+        let outcome = compile_with_dist_client(client.clone());
+
+        assert_eq!(0, client.alloc_calls.load(Ordering::SeqCst));
+        if remote_only {
+            let err = outcome.result.expect_err("remote_only must not fall back");
+            assert!(
+                format!("{err:#}").contains("remote_only: Failed to perform distributed compile"),
+                "{err:#}"
+            );
+            assert!(!outcome.local_compile_ran);
+        } else {
+            let (dist_type, _) = outcome.result.expect("should fall back to a local compile");
+            assert_eq!(DistType::Error, dist_type);
+            assert!(outcome.local_compile_ran);
+        }
+    }
+
+    #[test_case(true ; "remote_only")]
+    #[test_case(false ; "not remote_only")]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_http_client_error_does_not_fall_back(remote_only: bool) {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(
+            test_dist::ScriptedClient::new(remote_only)
+                .fail_put_toolchain(HttpClientError("MOCK: 403".to_owned()).into()),
+        );
+        let outcome = compile_with_dist_client(client.clone());
+
+        let err = outcome
+            .result
+            .expect_err("HttpClientError must not fall back");
+        assert!(err.downcast_ref::<HttpClientError>().is_some(), "{err:#}");
+        assert!(!outcome.local_compile_ran);
+        assert_eq!(1, client.put_toolchain_calls.load(Ordering::SeqCst));
+        assert_eq!(0, client.alloc_calls.load(Ordering::SeqCst));
+    }
+
+    /// Without remote_only an HttpClientError from the scheduler is neither
+    /// retried nor answered with a local compile.
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_without_remote_only_alloc_http_client_error_does_not_fall_back() {
+        use std::sync::atomic::Ordering;
+        let failure = test_dist::DistFailure::AllocHttpClientErr;
+        let client = Arc::new(test_dist::ScriptedClient::new(false).fail_times(failure, 1));
+        let outcome = compile_with_dist_client(client.clone());
+
+        let err = outcome
+            .result
+            .expect_err("HttpClientError must not fall back");
+        assert!(err.downcast_ref::<HttpClientError>().is_some(), "{err:#}");
+        assert!(!outcome.local_compile_ran);
+        assert_eq!(1, client.alloc_calls.load(Ordering::SeqCst));
+        assert_eq!(Duration::ZERO, outcome.backoff);
+    }
+
+    #[test_case(true ; "remote_only")]
+    #[test_case(false ; "not remote_only")]
+    #[cfg(feature = "dist-client")]
+    fn test_dist_toolchain_too_large_does_not_fall_back(remote_only: bool) {
+        use std::sync::atomic::Ordering;
+        let client = Arc::new(
+            test_dist::ScriptedClient::new(remote_only)
+                .fail_put_toolchain(lru_disk_cache::Error::FileTooLarge.into()),
+        );
+        let outcome = compile_with_dist_client(client.clone());
+
+        let err = outcome.result.expect_err("FileTooLarge must not fall back");
+        assert!(
+            format!("{err:#}").contains("Could not cache dist toolchain"),
+            "{err:#}"
+        );
+        assert!(!outcome.local_compile_ran);
+        assert_eq!(0, client.alloc_calls.load(Ordering::SeqCst));
+    }
 }
 
 #[cfg(test)]
@@ -3177,8 +3430,10 @@ mod test_dist {
         SubmitToolchainResult, Toolchain,
     };
     use async_trait::async_trait;
+    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::errors::*;
 
@@ -3569,6 +3824,220 @@ mod test_dist {
         }
         fn remote_only(&self) -> bool {
             false
+        }
+        fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    pub const REMOTE_STDOUT: &[u8] = b"remote stdout";
+    pub const REMOTE_STDERR: &[u8] = b"remote stderr";
+
+    /// The point in the dist protocol where a `ScriptedClient` injects a failure.
+    #[derive(Clone, Copy, Debug)]
+    pub enum DistFailure {
+        AllocErr,
+        AllocHttpClientErr,
+        AllocFail,
+        AllocCommunicationError,
+        SubmitErr,
+        SubmitJobNotFound,
+        SubmitCannotCache,
+        RunErr,
+        RunJobNotFound,
+    }
+
+    /// A dist client that returns scripted failures from alloc/submit/run
+    /// before succeeding like `OneshotClient`, and counts every call.
+    pub struct ScriptedClient {
+        remote_only: bool,
+        tc: Toolchain,
+        output: ProcessOutput,
+        put_toolchain_err: Mutex<Option<Error>>,
+        alloc_results: Mutex<VecDeque<Result<AllocJobResult>>>,
+        submit_results: Mutex<VecDeque<Result<SubmitToolchainResult>>>,
+        run_results: Mutex<VecDeque<Result<RunJobResult>>>,
+        pub put_toolchain_calls: AtomicUsize,
+        pub alloc_calls: AtomicUsize,
+        pub submit_calls: AtomicUsize,
+        pub run_calls: AtomicUsize,
+    }
+
+    impl ScriptedClient {
+        pub fn new(remote_only: bool) -> Self {
+            Self {
+                remote_only,
+                tc: Toolchain {
+                    archive_id: "somearchiveid".to_owned(),
+                },
+                output: ProcessOutput::fake_output(
+                    0,
+                    REMOTE_STDOUT.to_vec(),
+                    REMOTE_STDERR.to_vec(),
+                ),
+                put_toolchain_err: Mutex::default(),
+                alloc_results: Mutex::default(),
+                submit_results: Mutex::default(),
+                run_results: Mutex::default(),
+                put_toolchain_calls: AtomicUsize::default(),
+                alloc_calls: AtomicUsize::default(),
+                submit_calls: AtomicUsize::default(),
+                run_calls: AtomicUsize::default(),
+            }
+        }
+
+        pub fn fail_put_toolchain(self, err: Error) -> Self {
+            *self.put_toolchain_err.lock().unwrap() = Some(err);
+            self
+        }
+
+        /// Make the first `n` attempts fail at `failure`; later calls succeed.
+        pub fn fail_times(self, failure: DistFailure, n: usize) -> Self {
+            for _ in 0..n {
+                match failure {
+                    DistFailure::AllocErr => {
+                        self.push_alloc(Err(anyhow!("MOCK: alloc job failure")))
+                    }
+                    DistFailure::AllocHttpClientErr => self.push_alloc(Err(HttpClientError(
+                        "MOCK: alloc job client error".to_owned(),
+                    )
+                    .into())),
+                    DistFailure::AllocFail => self.push_alloc(Ok(AllocJobResult::Fail {
+                        msg: "MOCK: busy".to_owned(),
+                    })),
+                    DistFailure::AllocCommunicationError => {
+                        self.push_alloc(Ok(AllocJobResult::CommunicationError {
+                            msg: "MOCK: unreachable".to_owned(),
+                        }))
+                    }
+                    DistFailure::SubmitErr => {
+                        self.push_submit(Err(anyhow!("MOCK: submit toolchain failure")))
+                    }
+                    DistFailure::SubmitJobNotFound => {
+                        self.push_submit(Ok(SubmitToolchainResult::JobNotFound))
+                    }
+                    DistFailure::SubmitCannotCache => {
+                        self.push_submit(Ok(SubmitToolchainResult::CannotCache))
+                    }
+                    DistFailure::RunErr => self.push_run(Err(anyhow!("MOCK: run job failure"))),
+                    DistFailure::RunJobNotFound => self.push_run(Ok(RunJobResult::JobNotFound)),
+                }
+            }
+            self
+        }
+
+        /// Number of calls made to the dist operation that `failure` targets.
+        pub fn calls_at(&self, failure: DistFailure) -> usize {
+            let counter = match failure {
+                DistFailure::AllocErr
+                | DistFailure::AllocHttpClientErr
+                | DistFailure::AllocFail
+                | DistFailure::AllocCommunicationError => &self.alloc_calls,
+                DistFailure::SubmitErr
+                | DistFailure::SubmitJobNotFound
+                | DistFailure::SubmitCannotCache => &self.submit_calls,
+                DistFailure::RunErr | DistFailure::RunJobNotFound => &self.run_calls,
+            };
+            counter.load(Ordering::SeqCst)
+        }
+
+        fn push_alloc(&self, r: Result<AllocJobResult>) {
+            self.alloc_results.lock().unwrap().push_back(r);
+        }
+        fn push_submit(&self, r: Result<SubmitToolchainResult>) {
+            self.submit_results.lock().unwrap().push_back(r);
+        }
+        fn push_run(&self, r: Result<RunJobResult>) {
+            self.run_results.lock().unwrap().push_back(r);
+        }
+    }
+
+    #[async_trait]
+    impl dist::Client for ScriptedClient {
+        async fn do_alloc_job(&self, tc: Toolchain) -> Result<AllocJobResult> {
+            let n = self.alloc_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(self.tc, tc);
+            if let Some(r) = self.alloc_results.lock().unwrap().pop_front() {
+                return r;
+            }
+            Ok(AllocJobResult::Success {
+                job_alloc: JobAlloc {
+                    auth: "abcd".to_owned(),
+                    job_id: JobId(n as u64),
+                    server_id: ServerId::new(([0, 0, 0, 0], 1).into()),
+                },
+                need_toolchain: true,
+            })
+        }
+        async fn do_get_status(&self) -> Result<SchedulerStatusResult> {
+            unreachable!("fn do_get_status is not used for this test. qed")
+        }
+        async fn do_submit_toolchain(
+            &self,
+            _: JobAlloc,
+            tc: Toolchain,
+        ) -> Result<SubmitToolchainResult> {
+            self.submit_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(self.tc, tc);
+            self.submit_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(SubmitToolchainResult::Success))
+        }
+        async fn package_inputs(
+            &self,
+            _: CompileCommand,
+            outputs: Vec<String>,
+            inputs_packager: Box<dyn pkg::InputsPackager>,
+        ) -> Result<(Vec<u8>, PathTransformer)> {
+            let mut inputs = vec![];
+            let path_transformer = inputs_packager.write_inputs(&mut inputs).unwrap();
+            // Pass the output names through to do_run_job, like OneshotClient.
+            Ok((outputs.join("\n").into_bytes(), path_transformer))
+        }
+        async fn do_run_job(&self, _: JobAlloc, packaged_inputs: Vec<u8>) -> Result<RunJobResult> {
+            self.run_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(r) = self.run_results.lock().unwrap().pop_front() {
+                return r;
+            }
+            let outputs = String::from_utf8(packaged_inputs)
+                .unwrap()
+                .lines()
+                .map(|name| {
+                    let data = format!("some data in {}", name);
+                    let data = OutputData::try_from_reader(data.as_bytes()).unwrap();
+                    (name.to_string(), data)
+                })
+                .collect();
+            Ok(RunJobResult::Complete(JobComplete {
+                output: self.output.clone(),
+                outputs,
+            }))
+        }
+        async fn put_toolchain(
+            &self,
+            _: PathBuf,
+            _: String,
+            _: Box<dyn pkg::ToolchainPackager>,
+        ) -> Result<(Toolchain, Option<(String, PathBuf)>)> {
+            self.put_toolchain_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(err) = self.put_toolchain_err.lock().unwrap().take() {
+                return Err(err);
+            }
+            Ok((
+                self.tc.clone(),
+                Some((
+                    "/overridden/compiler".to_owned(),
+                    PathBuf::from("somearchiveid"),
+                )),
+            ))
+        }
+        fn rewrite_includes_only(&self) -> bool {
+            false
+        }
+        fn remote_only(&self) -> bool {
+            self.remote_only
         }
         fn get_custom_toolchain(&self, _exe: &Path) -> Option<PathBuf> {
             None
