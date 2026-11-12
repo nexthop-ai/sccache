@@ -14,7 +14,7 @@ use sccache::config::HTTPUrl;
 use sccache::dist::{
     self, AssignJobResult, CompileCommand, HeartbeatServerResult, InputsReader, JobId, JobState,
     RunJobResult, ServerIncoming, ServerNonce, ServerOutgoing, SubmitToolchainResult, Toolchain,
-    ToolchainReader, UpdateJobStateResult,
+    ToolchainReader,
 };
 use std::ffi::OsStr;
 use std::net::SocketAddr;
@@ -497,6 +497,11 @@ mod nonce_race_test {
                 .context("Updating job state failed")?;
             bail!("intentional failure after state updates")
         }
+        // handle_run_job moves straight from Started to Complete without
+        // executing anything, so no job is ever running across a heartbeat.
+        fn running_jobs(&self) -> Vec<JobId> {
+            Vec::new()
+        }
     }
 
     pub fn bincode_post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -607,6 +612,7 @@ fn test_dist_worker_restart_during_alloc() {
         server_nonce: ServerNonce::new(),
         cert_digest,
         cert_pem,
+        running_jobs: Vec::new(),
     };
     let hb_url = dist::http::urls::scheduler_heartbeat_server(&scheduler_url);
     let client = reqwest::blocking::Client::builder()
