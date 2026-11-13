@@ -78,3 +78,32 @@ pub struct Compile {
     /// The environment variables present when the compiler was executed, as (var, val).
     pub env_vars: Vec<(OsString, OsString)>,
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_compile_started_remote_only_round_trip() {
+        let bytes =
+            bincode::serialize(&CompileResponse::CompileStarted { remote_only: true }).unwrap();
+        let response: CompileResponse = bincode::deserialize(&bytes).unwrap();
+        assert!(matches!(
+            response,
+            CompileResponse::CompileStarted { remote_only: true }
+        ));
+    }
+
+    /// A server without the `remote_only` field sends `CompileStarted` as a
+    /// unit variant. bincode is not self-describing, so `#[serde(default)]`
+    /// has no effect and a newer client cannot read it.
+    #[test]
+    fn test_compile_started_without_remote_only_field_fails() {
+        #[derive(Serialize)]
+        enum OldCompileResponse {
+            CompileStarted,
+        }
+        let bytes = bincode::serialize(&OldCompileResponse::CompileStarted).unwrap();
+        assert!(bincode::deserialize::<CompileResponse>(&bytes).is_err());
+    }
+}

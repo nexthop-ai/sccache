@@ -860,3 +860,96 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 
     Ok(0)
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::mock_command::{MockChild, exit_status};
+    use crate::test::utils::{new_creator, next_command_calls, single_threaded_runtime};
+    use serial_test::serial;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const LOCAL_EXIT_CODE: i32 = 3;
+
+    struct Outcome {
+        result: Result<i32>,
+        local_compile_ran: bool,
+    }
+
+    /// Handle a `CompileStarted` response whose server writes `server_bytes`
+    /// and then closes the connection.
+    fn compile_started_then_disconnect(remote_only: bool, server_bytes: &[u8]) -> Outcome {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.write_all(server_bytes).unwrap();
+        drop(server);
+        let mut conn = ServerConnection::new(Box::new(client)).unwrap();
+
+        let creator = new_creator();
+        let local_compile_ran = Arc::new(AtomicBool::new(false));
+        let ran = local_compile_ran.clone();
+        next_command_calls(&creator, move |_| {
+            ran.store(true, Ordering::SeqCst);
+            Ok(MockChild::new(exit_status(LOCAL_EXIT_CODE << 8), "", ""))
+        });
+        let mut runtime = single_threaded_runtime();
+        let (mut stdout, mut stderr) = (vec![], vec![]);
+        let result = handle_compile_response(
+            creator,
+            &mut runtime,
+            &mut conn,
+            CompileResponse::CompileStarted { remote_only },
+            Path::new("/usr/bin/cc"),
+            vec!["-c".into(), "foo.c".into()],
+            Path::new("."),
+            &mut stdout,
+            &mut stderr,
+        );
+        Outcome {
+            result,
+            local_compile_ran: local_compile_ran.load(Ordering::SeqCst),
+        }
+    }
+
+    /// A length-prefixed frame that is not a valid `Response`.
+    const GARBAGE_FRAME: &[u8] = &[0, 0, 0, 4, 0xff, 0xff, 0xff, 0xff];
+
+    #[test]
+    fn test_compile_started_remote_only_server_eof_does_not_compile_locally() {
+        let outcome = compile_started_then_disconnect(true, &[]);
+        let err = outcome.result.expect_err("remote_only must not fall back");
+        assert!(format!("{err:#}").contains("remote_only"), "{err:#}");
+        assert!(!outcome.local_compile_ran);
+    }
+
+    #[test]
+    fn test_compile_started_server_eof_compiles_locally() {
+        let outcome = compile_started_then_disconnect(false, &[]);
+        assert_eq!(LOCAL_EXIT_CODE, outcome.result.unwrap());
+        assert!(outcome.local_compile_ran);
+    }
+
+    #[test]
+    #[serial]
+    fn test_compile_started_remote_only_ignored_read_error_does_not_compile_locally() {
+        let outcome = temp_env::with_var("SCCACHE_IGNORE_SERVER_IO_ERROR", Some("1"), || {
+            compile_started_then_disconnect(true, GARBAGE_FRAME)
+        });
+        let err = outcome.result.expect_err("remote_only must not fall back");
+        assert!(format!("{err:#}").contains("remote_only"), "{err:#}");
+        assert!(!outcome.local_compile_ran);
+    }
+
+    #[test]
+    #[serial]
+    fn test_compile_started_ignored_read_error_compiles_locally() {
+        let outcome = temp_env::with_var("SCCACHE_IGNORE_SERVER_IO_ERROR", Some("1"), || {
+            compile_started_then_disconnect(false, GARBAGE_FRAME)
+        });
+        assert_eq!(LOCAL_EXIT_CODE, outcome.result.unwrap());
+        assert!(outcome.local_compile_ran);
+    }
+}
