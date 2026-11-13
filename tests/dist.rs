@@ -82,8 +82,9 @@ fn rust_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path:
         version = "0.1.0"
         edition = "2021"
         [dependencies]
-        # Pinned: the point of this test is that distributed compilation works,
-        # not that it keeps up with whatever libc published most recently.
+        # Newer libc reaches modules via `#[path]` attributes containing `..`, which
+        # pkg::simplify_path normalizes away, so the build server can't open them and
+        # the crate compiles locally. https://github.com/mozilla/sccache/issues/3031
         libc = "=0.2.169""#,
     );
     write_source(
