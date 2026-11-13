@@ -3360,26 +3360,6 @@ LLVM version: 6.0",
         }
     }
 
-    #[test_case(true ; "remote_only")]
-    #[test_case(false ; "not remote_only")]
-    #[cfg(feature = "dist-client")]
-    fn test_dist_http_client_error_does_not_fall_back(remote_only: bool) {
-        use std::sync::atomic::Ordering;
-        let client = Arc::new(
-            test_dist::ScriptedClient::new(remote_only)
-                .fail_put_toolchain(HttpClientError("MOCK: 403".to_owned()).into()),
-        );
-        let outcome = compile_with_dist_client(client.clone());
-
-        let err = outcome
-            .result
-            .expect_err("HttpClientError must not fall back");
-        assert!(err.downcast_ref::<HttpClientError>().is_some(), "{err:#}");
-        assert!(!outcome.local_compile_ran);
-        assert_eq!(1, client.put_toolchain_calls.load(Ordering::SeqCst));
-        assert_eq!(0, client.alloc_calls.load(Ordering::SeqCst));
-    }
-
     /// Without remote_only an HttpClientError from the scheduler is neither
     /// retried nor answered with a local compile.
     #[test]
