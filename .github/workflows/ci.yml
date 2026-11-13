@@ -3,21 +3,26 @@ on: [ push, pull_request ]
 
 jobs:
   lint:
-    name: ${{ matrix.component }} ${{ matrix.os }}
+    name: ${{ matrix.component }} ${{ matrix.os }} ${{ matrix.extra_desc }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        #os: [ ubuntu-latest, macOS-latest, windows-latest ]
-        os: [ ubuntu-latest ]
-        component: [ clippy ]
+        # Include-only, so each entry is its own job; with a base matrix the
+        # second clippy entry would overwrite the first one's cargo_cmd.
         include:
           - component: rustfmt
             cargo_cmd: fmt -- --check
             os: ubuntu-latest
           - component: clippy
             cargo_cmd: clippy --locked --all-targets -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
+            os: ubuntu-latest
+          # tests/dist.rs only builds with the dist features enabled.
+          - component: clippy
+            extra_desc: dist-tests
+            cargo_cmd: clippy --locked --all-targets --features dist-tests -- -D warnings -A unknown-lints -A clippy::type_complexity -A clippy::new-without-default
+            os: ubuntu-latest
     steps:
       - name: Clone repository
         uses: actions/checkout@v5
