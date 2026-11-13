@@ -852,6 +852,10 @@ where
             );
             let jares = match dist_client.do_alloc_job(dist_toolchain.clone()).await {
                 Ok(result) => result,
+                // A scheduler 4xx (failed client auth, bad request) persists
+                // across retries. Worker 4xx errors from submit/run are still
+                // retried: a stale job token is replaced by re-allocating.
+                Err(e) if e.is::<HttpClientError>() => return Err(e),
                 Err(e) => {
                     maybe_retry(attempt, format!("Allocation request failed: {}", e), e).await?;
                     continue;
@@ -3361,14 +3365,15 @@ LLVM version: 6.0",
         }
     }
 
-    /// Without remote_only an HttpClientError from the scheduler is neither
-    /// retried nor answered with a local compile.
-    #[test]
+    /// An HttpClientError from the scheduler is neither retried nor answered
+    /// with a local compile.
+    #[test_case(true ; "remote_only")]
+    #[test_case(false ; "not remote_only")]
     #[cfg(feature = "dist-client")]
-    fn test_dist_without_remote_only_alloc_http_client_error_does_not_fall_back() {
+    fn test_dist_alloc_http_client_error_fails(remote_only: bool) {
         use std::sync::atomic::Ordering;
         let failure = test_dist::DistFailure::AllocHttpClientErr;
-        let client = Arc::new(test_dist::ScriptedClient::new(false).fail_times(failure, 1));
+        let client = Arc::new(test_dist::ScriptedClient::new(remote_only).fail_times(failure, 1));
         let outcome = compile_with_dist_client(client.clone());
 
         let err = outcome
