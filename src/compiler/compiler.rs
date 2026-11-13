@@ -3277,13 +3277,14 @@ LLVM version: 6.0",
     }
 
     #[test_case(test_dist::DistFailure::AllocErr ; "alloc error")]
-    #[test_case(test_dist::DistFailure::AllocHttpClientErr ; "alloc http client error")]
     #[test_case(test_dist::DistFailure::AllocFail ; "alloc fail")]
     #[test_case(test_dist::DistFailure::AllocCommunicationError ; "alloc communication error")]
     #[test_case(test_dist::DistFailure::SubmitErr ; "submit toolchain error")]
+    #[test_case(test_dist::DistFailure::SubmitHttpClientErr ; "submit toolchain http client error")]
     #[test_case(test_dist::DistFailure::SubmitJobNotFound ; "submit toolchain job not found")]
     #[test_case(test_dist::DistFailure::SubmitCannotCache ; "submit toolchain cannot cache")]
     #[test_case(test_dist::DistFailure::RunErr ; "run job error")]
+    #[test_case(test_dist::DistFailure::RunHttpClientErr ; "run job http client error")]
     #[test_case(test_dist::DistFailure::RunJobNotFound ; "run job not found")]
     #[cfg(feature = "dist-client")]
     fn test_dist_remote_only_retries_until_success(failure: test_dist::DistFailure) {
@@ -3821,9 +3822,12 @@ mod test_dist {
         AllocFail,
         AllocCommunicationError,
         SubmitErr,
+        SubmitHttpClientErr,
         SubmitJobNotFound,
         SubmitCannotCache,
         RunErr,
+        /// A worker rejecting the job token, e.g. after it restarted.
+        RunHttpClientErr,
         RunJobNotFound,
     }
 
@@ -3893,6 +3897,10 @@ mod test_dist {
                     DistFailure::SubmitErr => {
                         self.push_submit(Err(anyhow!("MOCK: submit toolchain failure")))
                     }
+                    DistFailure::SubmitHttpClientErr => self.push_submit(Err(HttpClientError(
+                        "Error 401: MOCK: invalid_jwt".to_owned(),
+                    )
+                    .into())),
                     DistFailure::SubmitJobNotFound => {
                         self.push_submit(Ok(SubmitToolchainResult::JobNotFound))
                     }
@@ -3900,6 +3908,10 @@ mod test_dist {
                         self.push_submit(Ok(SubmitToolchainResult::CannotCache))
                     }
                     DistFailure::RunErr => self.push_run(Err(anyhow!("MOCK: run job failure"))),
+                    DistFailure::RunHttpClientErr => self.push_run(Err(HttpClientError(
+                        "Error 401: MOCK: invalid_jwt".to_owned(),
+                    )
+                    .into())),
                     DistFailure::RunJobNotFound => self.push_run(Ok(RunJobResult::JobNotFound)),
                 }
             }
@@ -3914,9 +3926,12 @@ mod test_dist {
                 | DistFailure::AllocFail
                 | DistFailure::AllocCommunicationError => &self.alloc_calls,
                 DistFailure::SubmitErr
+                | DistFailure::SubmitHttpClientErr
                 | DistFailure::SubmitJobNotFound
                 | DistFailure::SubmitCannotCache => &self.submit_calls,
-                DistFailure::RunErr | DistFailure::RunJobNotFound => &self.run_calls,
+                DistFailure::RunErr
+                | DistFailure::RunHttpClientErr
+                | DistFailure::RunJobNotFound => &self.run_calls,
             };
             counter.load(Ordering::SeqCst)
         }
