@@ -3403,7 +3403,7 @@ LLVM version: 6.0",
 
 #[cfg(test)]
 #[cfg(feature = "dist-client")]
-mod test_dist {
+pub(crate) mod test_dist {
     use crate::dist::pkg;
     use crate::dist::{
         self, AllocJobResult, CompileCommand, JobAlloc, JobComplete, JobId, OutputData,

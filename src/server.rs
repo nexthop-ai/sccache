@@ -1003,6 +1003,7 @@ where
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
+        let remote_only = dist_client.remote_only();
         SccacheService {
             stats: Arc::default(),
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
@@ -1014,7 +1015,7 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
-                    remote_only: false,
+                    remote_only,
                 }),
                 dist_client,
             ))),
@@ -2295,6 +2296,61 @@ fn waits_until_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "dist-client")]
+    #[test_case::test_case(true ; "remote_only")]
+    #[test_case::test_case(false ; "not remote_only")]
+    fn test_compile_started_reports_remote_only(remote_only: bool) {
+        use crate::compiler::test_dist::ScriptedClient;
+        use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+        use crate::test::mock_storage::MockStorage;
+        use crate::test::utils::{TestFixture, new_creator, next_command};
+
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        let creator = new_creator();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        let compiler = runtime
+            .block_on(get_compiler_info(
+                creator,
+                &gcc,
+                f.tempdir.path(),
+                &[],
+                &[],
+                &pool,
+                None,
+            ))
+            .map(|(c, _)| c);
+        let service =
+            SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::mock_with_dist_client(
+                Arc::new(ScriptedClient::new(remote_only)),
+                Arc::new(MockStorage::new(None, false)),
+                pool,
+            );
+
+        let response = runtime.block_on(service.check_compiler(
+            compiler,
+            vec!["-c".into(), "foo.c".into(), "-o".into(), "foo.o".into()],
+            f.tempdir.path().to_path_buf(),
+            vec![],
+        ));
+        match response {
+            Message::WithBody(
+                Response::Compile(CompileResponse::CompileStarted { remote_only: r }),
+                _,
+            ) => {
+                assert_eq!(remote_only, r)
+            }
+            Message::WithBody(r, _) | Message::WithoutBody(r) => {
+                panic!("expected CompileStarted, got {r:?}")
+            }
+        }
+    }
 
     struct StringWriter {
         buffer: String,
