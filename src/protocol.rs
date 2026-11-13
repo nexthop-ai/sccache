@@ -95,20 +95,15 @@ mod test {
     }
 
     /// A server without the `remote_only` field sends `CompileStarted` as a
-    /// unit variant.
+    /// unit variant. bincode is not self-describing, so `#[serde(default)]`
+    /// has no effect and a newer client cannot read it.
     #[test]
-    #[ignore = "bincode is not self-describing, so #[serde(default)] does not apply: \
-                deserializing fails with UnexpectedEof"]
-    fn test_compile_started_without_remote_only_field() {
+    fn test_compile_started_without_remote_only_field_fails() {
         #[derive(Serialize)]
         enum OldCompileResponse {
             CompileStarted,
         }
         let bytes = bincode::serialize(&OldCompileResponse::CompileStarted).unwrap();
-        let response: CompileResponse = bincode::deserialize(&bytes).unwrap();
-        assert!(matches!(
-            response,
-            CompileResponse::CompileStarted { remote_only: false }
-        ));
+        assert!(bincode::deserialize::<CompileResponse>(&bytes).is_err());
     }
 }
