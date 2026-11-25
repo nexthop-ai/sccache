@@ -1003,6 +1003,7 @@ where
         let (tx, _) = mpsc::channel(1);
         let (_, info) = WaitUntilZero::new();
         let client = Client::new_num(1);
+        let remote_only = dist_client.remote_only();
         SccacheService {
             stats: Arc::default(),
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
@@ -1014,7 +1015,7 @@ where
                     toolchain_cache_size: 0,
                     toolchains: vec![],
                     rewrite_includes_only: false,
-                    remote_only: false,
+                    remote_only,
                 }),
                 dist_client,
             ))),
@@ -2295,6 +2296,189 @@ fn waits_until_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "dist-client")]
+    #[test_case::test_case(true ; "remote_only")]
+    #[test_case::test_case(false ; "not remote_only")]
+    fn test_compile_started_reports_remote_only(remote_only: bool) {
+        use crate::compiler::test_dist::ScriptedClient;
+        use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+        use crate::test::mock_storage::MockStorage;
+        use crate::test::utils::{TestFixture, new_creator, next_command};
+
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        let creator = new_creator();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        let compiler = runtime
+            .block_on(get_compiler_info(
+                creator,
+                &gcc,
+                f.tempdir.path(),
+                &[],
+                &[],
+                &pool,
+                None,
+            ))
+            .map(|(c, _)| c);
+        let service =
+            SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::mock_with_dist_client(
+                Arc::new(ScriptedClient::new(remote_only)),
+                Arc::new(MockStorage::new(None, false)),
+                pool,
+            );
+
+        let response = runtime.block_on(service.check_compiler(
+            compiler,
+            vec!["-c".into(), "foo.c".into(), "-o".into(), "foo.o".into()],
+            f.tempdir.path().to_path_buf(),
+            vec![],
+        ));
+        match response {
+            Message::WithBody(
+                Response::Compile(CompileResponse::CompileStarted { remote_only: r }),
+                _,
+            ) => {
+                assert_eq!(remote_only, r)
+            }
+            Message::WithBody(r, _) | Message::WithoutBody(r) => {
+                panic!("expected CompileStarted, got {r:?}")
+            }
+        }
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[derive(Clone, Copy)]
+    enum NoClientState {
+        FailWithMessage,
+        RetryCreateAt,
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test_case::test_case(NoClientState::FailWithMessage, true ; "fail with message, remote_only")]
+    #[test_case::test_case(NoClientState::FailWithMessage, false ; "fail with message, not remote_only")]
+    #[test_case::test_case(NoClientState::RetryCreateAt, true ; "retry create, remote_only")]
+    #[test_case::test_case(NoClientState::RetryCreateAt, false ; "retry create, not remote_only")]
+    fn test_start_compile_task_without_dist_client(state: NoClientState, remote_only: bool) {
+        use crate::cache::Cache;
+        use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+        use crate::test::mock_storage::MockStorage;
+        use crate::test::utils::{TestFixture, new_creator, next_command, next_command_calls};
+
+        const AUTH_ERROR: &str = "could not load client auth token";
+
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        // The remote_only retry loop sleeps between attempts; a paused clock
+        // lets those sleeps and the timeout below elapse instantly.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let pool = runtime.handle().clone();
+        let creator = new_creator();
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        let compiler = runtime
+            .block_on(get_compiler_info(
+                creator,
+                &gcc,
+                f.tempdir.path(),
+                &[],
+                &[],
+                &pool,
+                None,
+            ))
+            .unwrap()
+            .0;
+
+        let storage = MockStorage::new(None, false);
+        storage.next_get(Ok(Cache::Miss));
+        let mut service =
+            SccacheService::<Arc<std::sync::Mutex<MockCommandCreator>>>::mock_with_storage(
+                Arc::new(storage),
+                pool.clone(),
+            );
+        let config = Box::new(DistClientConfig {
+            pool: pool.clone(),
+            scheduler_url: None,
+            auth: config::DistAuth::Token { token: "".into() },
+            cache_dir: "".into(),
+            toolchain_cache_size: 0,
+            toolchains: vec![],
+            rewrite_includes_only: false,
+            remote_only,
+        });
+        service.dist_client = Arc::new(DistClientContainer::new_with_state(match state {
+            NoClientState::FailWithMessage => {
+                DistClientState::FailWithMessage(config, AUTH_ERROR.into())
+            }
+            // A retry time in the past would make get_client_and_config try
+            // to create a real client.
+            NoClientState::RetryCreateAt => DistClientState::RetryCreateAt(
+                config,
+                Instant::now() + Duration::from_secs(24 * 60 * 60),
+            ),
+        }));
+
+        // A local compile consumes both of these: the preprocessor run, then
+        // the compiler run.
+        next_command(
+            &service.creator,
+            Ok(MockChild::new(exit_status(0), "preprocessor output", "")),
+        );
+        let obj = f.tempdir.path().join("foo.o");
+        next_command_calls(&service.creator, move |_| {
+            fs::File::create(&obj)?.write_all(b"file contents")?;
+            Ok(MockChild::new(exit_status(0), "compiler stdout", ""))
+        });
+
+        let arguments = ovec!["-c", "foo.c", "-o", "foo.o"];
+        let hasher = match compiler.parse_arguments(&arguments, f.tempdir.path(), &[]) {
+            CompilerArguments::Ok(h) => h,
+            o => panic!("Bad result from parse_arguments: {:?}", o),
+        };
+        let task = service.clone().start_compile_task(
+            compiler,
+            hasher,
+            arguments,
+            f.tempdir.path().to_path_buf(),
+            vec![],
+        );
+        let result = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(60 * 60), task).await });
+        let unused_commands = service.creator.lock().unwrap().children.len();
+
+        match (state, remote_only) {
+            (_, false) => {
+                let finished = result.expect("local compile timed out").unwrap();
+                assert_eq!(Some(0), finished.retcode);
+                assert_eq!(b"compiler stdout", finished.stdout.as_slice());
+                assert_eq!(0, unused_commands);
+            }
+            (NoClientState::FailWithMessage, true) => {
+                let finished = result.expect("compile task timed out").unwrap();
+                assert_eq!(Some(-2), finished.retcode);
+                let stderr = String::from_utf8(finished.stderr).unwrap();
+                assert!(stderr.contains(AUTH_ERROR), "stderr: {stderr}");
+                assert_eq!(2, unused_commands, "compiled locally");
+            }
+            (NoClientState::RetryCreateAt, true) => {
+                if let Ok(finished) = result {
+                    panic!("expected the compile to keep retrying, got {finished:?}");
+                }
+                assert_eq!(2, unused_commands, "compiled locally");
+            }
+        }
+    }
 
     struct StringWriter {
         buffer: String,
