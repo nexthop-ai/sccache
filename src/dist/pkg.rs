@@ -402,10 +402,13 @@ mod toolchain_imp {
     }
 }
 
-pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
+/// A header with the metadata of `src`, for an entry written with `tar::Builder::append_data`
+/// and the path from `tar_path`. `append_data` adds a GNU long-name entry when the path is too
+/// long for the header itself, which a ustar header's 100 + 155 byte split often is.
+pub fn make_tar_header(src: &Path) -> io::Result<tar::Header> {
     let metadata_res = fs::metadata(src);
 
-    let mut file_header = tar::Header::new_ustar();
+    let mut file_header = tar::Header::new_gnu();
     // TODO: test this works
     if let Ok(metadata) = metadata_res {
         // TODO: if the source file is a symlink, I think this does bad things
@@ -421,24 +424,21 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
         file_header.set_mtime(0);
         file_header
             .set_device_major(0)
-            .expect("expected a ustar header");
+            .expect("expected a gnu header");
         file_header
             .set_device_minor(0)
-            .expect("expected a ustar header");
+            .expect("expected a gnu header");
         file_header.set_entry_type(tar::EntryType::file());
     }
+    Ok(file_header)
+}
 
-    // tar-rs imposes that `set_path` takes a relative path
+/// The archive path for the absolute dist path `dest`: tar-rs takes relative paths.
+pub fn tar_path(dest: &str) -> &Path {
     assert!(dest.starts_with('/'));
     let dest = dest.trim_start_matches('/');
     assert!(!dest.starts_with('/'));
-    // `set_path` converts its argument to a Path and back to bytes on Windows, so this is
-    // a bit of an inefficient round-trip. Windows path separators will also be normalised
-    // to be like Unix, and the path is (now) relative so there should be no funny results
-    // due to Windows
-    // TODO: should really use a `set_path_str` or similar
-    file_header.set_path(dest)?;
-    Ok(file_header)
+    Path::new(dest)
 }
 
 /// Simplify a path to one without any relative components, erroring if it looks
@@ -493,5 +493,54 @@ impl SimplifyPath<'_> {
             }
         }
         Ok(final_path)
+    }
+}
+
+#[cfg(test)]
+mod tar_tests {
+    use super::{make_tar_header, tar_path};
+    use std::io::Read;
+    use std::path::Path;
+
+    // A generated source in a Bazel external repo under a nested output root: no split into
+    // a 155-byte prefix and a 100-byte name fits.
+    const LONG_DEST: &str = "/home/user/.cache/build-env/home/.cache/bazel/_bazel_user/\
+0123456789abcdef0123456789abcdef/execroot/_main/bazel-out/k8-opt/bin/external/\
+some_module++some_extension+some_repo/some/deeply/nested/package/gen-cpp2/\
+a_long_generated_source_file_name.cpp";
+
+    fn round_trip(dest: &str) {
+        let data = b"int f() { return 1; }\n";
+        let mut header = make_tar_header(Path::new("/nonexistent")).unwrap();
+        header.set_size(data.len() as u64);
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_data(&mut header, tar_path(dest), &data[..])
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(archive.as_slice());
+        let mut entries = archive.entries().unwrap();
+        let mut entry = entries.next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap(), tar_path(dest));
+        let mut read = vec![];
+        entry.read_to_end(&mut read).unwrap();
+        assert_eq!(read, data);
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn short_path_round_trips() {
+        round_trip("/tmp/x.cpp");
+    }
+
+    #[test]
+    fn path_too_long_for_a_ustar_header_round_trips() {
+        assert!(
+            tar::Header::new_ustar()
+                .set_path(tar_path(LONG_DEST))
+                .is_err()
+        );
+        round_trip(LONG_DEST);
     }
 }
