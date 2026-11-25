@@ -2170,7 +2170,8 @@ impl pkg::InputsPackager for RustInputsPackager {
         let mut builder = tar::Builder::new(wtr);
 
         for (input_path, dist_input_path) in all_tar_inputs.iter() {
-            let mut file_header = pkg::make_tar_header(input_path, dist_input_path)?;
+            let mut file_header = pkg::make_tar_header(input_path)?;
+            let tar_path = pkg::tar_path(dist_input_path);
             let file = fs::File::open(input_path)?;
             if can_trim_rlibs && can_trim_this(input_path) {
                 let mut archive = ar::Archive::new(file);
@@ -2187,13 +2188,11 @@ impl pkg::InputsPackager for RustInputsPackager {
                         ar_builder.append(&header, &mut entry)?
                     }
                     file_header.set_size(metadata_ar.len() as u64);
-                    file_header.set_cksum();
-                    builder.append(&file_header, metadata_ar.as_slice())?;
+                    builder.append_data(&mut file_header, tar_path, metadata_ar.as_slice())?;
                     break;
                 }
             } else {
-                file_header.set_cksum();
-                builder.append(&file_header, file)?
+                builder.append_data(&mut file_header, tar_path, file)?
             }
         }
 
