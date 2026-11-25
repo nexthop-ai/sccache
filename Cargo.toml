@@ -218,3 +218,9 @@ dist-tests = ["dist-client", "dist-server"]
 [workspace]
 exclude = ["tests/test-crate"]
 members = ["tests/randomize_readdir"]
+
+[patch.crates-io]
+# tiny_http 0.12.0 plus a fix that runs the TLS handshake outside the accept
+# thread, so a client that connects and stays silent cannot stop sccache-dist
+# from accepting other connections.
+tiny_http = { git = "https://github.com/nexthop-ai/tiny-http", rev = "b12b28001523422febfe01f48138d1bb60adc886" }
