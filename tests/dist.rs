@@ -14,7 +14,7 @@ use sccache::config::HTTPUrl;
 use sccache::dist::{
     self, AssignJobResult, CompileCommand, HeartbeatServerResult, InputsReader, JobId, JobState,
     RunJobResult, ServerIncoming, ServerNonce, ServerOutgoing, SubmitToolchainResult, Toolchain,
-    ToolchainReader, UpdateJobStateResult,
+    ToolchainReader,
 };
 use std::ffi::OsStr;
 use std::net::SocketAddr;
@@ -82,7 +82,10 @@ fn rust_compile(tmpdir: &Path, sccache_cfg_path: &Path, sccache_cached_cfg_path:
         version = "0.1.0"
         edition = "2021"
         [dependencies]
-        libc = "0.2.169""#,
+        # Newer libc reaches modules via `#[path]` attributes containing `..`, which
+        # pkg::simplify_path normalizes away, so the build server can't open them and
+        # the crate compiles locally. https://github.com/mozilla/sccache/issues/3031
+        libc = "=0.2.169""#,
     );
     write_source(
         &cargo_path,
@@ -497,6 +500,11 @@ mod nonce_race_test {
                 .context("Updating job state failed")?;
             bail!("intentional failure after state updates")
         }
+        // handle_run_job moves straight from Started to Complete without
+        // executing anything, so no job is ever running across a heartbeat.
+        fn running_jobs(&self) -> Vec<JobId> {
+            Vec::new()
+        }
     }
 
     pub fn bincode_post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -607,6 +615,7 @@ fn test_dist_worker_restart_during_alloc() {
         server_nonce: ServerNonce::new(),
         cert_digest,
         cert_pem,
+        running_jobs: Vec::new(),
     };
     let hb_url = dist::http::urls::scheduler_heartbeat_server(&scheduler_url);
     let client = reqwest::blocking::Client::builder()
